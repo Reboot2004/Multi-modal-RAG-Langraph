@@ -43,29 +43,96 @@ Repository: https://github.com/Reboot2004/Multi-modal-RAG-Langraph
 
 ## Setup
 
-1. Create and activate virtual environment.
-2. Install dependencies:
+1. Clone the repository:
+
+```bash
+git clone https://github.com/Reboot2004/Multi-modal-RAG-Langraph.git
+cd Multi-modal-RAG-Langraph
+```
+
+2. Create and activate a virtual environment.
+
+Windows PowerShell:
+
+```powershell
+python -m venv venv
+Set-ExecutionPolicy -Scope Process -ExecutionPolicy RemoteSigned
+& .\venv\Scripts\Activate.ps1
+```
+
+Windows CMD:
+
+```bat
+python -m venv venv
+venv\Scripts\activate.bat
+```
+
+macOS/Linux:
+
+```bash
+python3 -m venv venv
+source venv/bin/activate
+```
+
+3. Install dependencies:
 
 ```bash
 pip install -r requirements.txt
 ```
 
-3. Configure environment variables (copy from `.env.example`):
+4. Create your environment file:
+
+```bash
+cp .env.example .env
+```
+
+If `cp` is not available on Windows PowerShell:
+
+```powershell
+Copy-Item .env.example .env
+```
+
+5. Add API keys to `.env`:
 
 - `GROQ_API_KEY` (required for Groq)
 - `OPENROUTER_API_KEY` (optional)
 
+API key links:
+
+- Groq Console: https://console.groq.com/keys
+- Groq Signup: https://console.groq.com/
+- OpenRouter Keys: https://openrouter.ai/keys
+- OpenRouter Signup: https://openrouter.ai/
+
+Example `.env`:
+
+```env
+GROQ_API_KEY=your_groq_key_here
+OPENROUTER_API_KEY=your_openrouter_key_here
+```
+
 ## Run
+
+Start Streamlit:
 
 ```bash
 streamlit run app.py
 ```
 
-or use:
+Alternative for Windows:
 
 ```bash
 run_app.bat
 ```
+
+Then open the local URL shown by Streamlit (usually `http://localhost:8501`).
+
+## First Run Checklist
+
+1. Virtual environment is active.
+2. Dependencies installed successfully.
+3. `.env` exists and contains at least `GROQ_API_KEY`.
+4. `streamlit run app.py` starts without import errors.
 
 ## Notes
 
