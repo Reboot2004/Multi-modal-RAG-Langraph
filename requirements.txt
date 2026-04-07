@@ -1,0 +1,44 @@
+# Core App
+streamlit==1.33.0
+
+# PDF + Document Processing
+pymupdf==1.24.1
+pdfplumber==0.11.0
+Pillow==10.3.0
+
+# OCR
+paddleocr==2.7.3
+paddlepaddle==2.6.2
+
+# ML Stack (LOCKED STABLE)
+torch==2.2.2
+torchvision==0.17.2
+torchaudio==2.2.2
+transformers==4.38.2
+sentence-transformers==2.6.1
+
+# Vector DB
+faiss-cpu==1.7.4
+
+# Utilities
+langdetect==1.0.9
+numpy==1.26.4
+pandas==2.2.2
+requests==2.32.3
+av==12.3.0
+beautifulsoup4==4.14.0
+chonkie>=0.5.1
+python-dotenv>=1.0.1
+python-docx==1.2.0
+python-pptx==0.6.23
+xlrd==2.0.1
+
+# Groq API
+groq==0.5.0
+
+# LangGraph Orchestration
+langgraph>=0.2.0
+
+# Local ASR (Audio / Video)
+faster-whisper==1.0.3
+jiwer==3.0.5
