@@ -8,6 +8,7 @@ import re
 import html
 import gc
 import pandas as pd
+import time
 
 from ingestion.loader import DocumentLoader
 from embeddings.embedder import MultilingualEmbedder
@@ -25,9 +26,21 @@ from orchestration.hierarchical_retriever import HierarchicalRetriever
 from orchestration.tier3_agentic_rag import Tier3AgenticRAG
 from orchestration.langgraph_index import LangGraphIndexOrchestrator
 from orchestration.langgraph_audio_index import LangGraphAudioIndexOrchestrator
+from processing.language_detector import LanguageDetector
 from utils.conversation_memory import ConversationMemory
 from utils.eval_logger import EvalLogger
 from utils.eval_dashboard import EvalDashboard
+from utils.pii_guard import PIIGuard
+from utils.feedback_store import FeedbackStore
+from utils.data_lifecycle import DataLifecycleManager
+from utils.task_queue import TaskQueue
+from utils.reliability_guard import CircuitBreaker, QualityRollbackGuard
+from utils.production_observability import (
+    ProductionTelemetry,
+    SLOMonitor,
+    estimate_tokens,
+    estimate_cost_usd,
+)
 from config.settings import (
     ENABLE_HYPE,
     ENABLE_AUDIO_VIDEO_INGESTION,
@@ -67,6 +80,16 @@ from config.settings import (
     HIERARCHICAL_DIVERSITY_PENALTY,
     HIERARCHICAL_USE_DIVERSITY,
     ENABLE_EVAL_DASHBOARD,
+    ENABLE_PII_REDACTION,
+    PII_REDACTION_LOGS_ONLY,
+    ENABLE_DEGRADED_MODE,
+    ENABLE_CIRCUIT_BREAKER,
+    ENABLE_PRODUCTION_TELEMETRY,
+    ENABLE_HUMAN_FEEDBACK,
+    ENABLE_DATA_LIFECYCLE,
+    ENABLE_QUALITY_ROLLBACK_GUARD,
+    CITATION_IN_PROMPT,
+    ENABLE_ASYNC_INGESTION_WORKERS,
 )
 from pipeline_logger import get_logger, set_debug_enabled
 
@@ -150,6 +173,35 @@ def _strip_question_echo(answer: str, query: str) -> str:
             lines = lines[1:]
 
     return "\n".join(lines).strip() if lines else cleaned
+
+
+def _safe_for_logs(payload):
+    if ENABLE_PII_REDACTION and PII_REDACTION_LOGS_ONLY:
+        return PIIGuard.sanitize_payload(payload)
+    return payload
+
+
+def _build_degraded_answer(query: str, retrieved_docs: list) -> str:
+    if not retrieved_docs:
+        return (
+            "I could not complete full generation right now. "
+            "Please retry in a moment."
+        )
+
+    lines = [
+        "The generator is temporarily unavailable. Here is a grounded extractive summary from top sources:",
+        "",
+    ]
+    for idx, item in enumerate(retrieved_docs[:3], start=1):
+        meta = item.get("metadata", {})
+        source = meta.get("source", "unknown")
+        page = meta.get("page", "?")
+        text = (item.get("text", "") or "").strip().replace("\n", " ")
+        lines.append(f"{idx}. [{source} | Page {page}] {text[:280]}")
+
+    lines.append("")
+    lines.append("Retry shortly for a full synthesized answer.")
+    return "\n".join(lines)
 
 
 def _enforce_answer_language(
@@ -443,6 +495,18 @@ if "groq_api_key_input" not in st.session_state:
 if "openrouter_api_key_input" not in st.session_state:
     st.session_state.openrouter_api_key_input = ""
 
+if "prod_telemetry" not in st.session_state:
+    st.session_state.prod_telemetry = ProductionTelemetry()
+
+if "slo_monitor" not in st.session_state:
+    st.session_state.slo_monitor = SLOMonitor()
+
+if "rollback_guard" not in st.session_state:
+    st.session_state.rollback_guard = QualityRollbackGuard()
+
+if "task_queue" not in st.session_state:
+    st.session_state.task_queue = TaskQueue()
+
 with st.sidebar:
     st.markdown("### LLM Runtime")
     selected_provider_label = st.selectbox(
@@ -634,11 +698,19 @@ if uploaded_files:
                     stem = os.path.splitext(src)[0].lower().strip()
                     reference_map[src] = ref_by_stem.get(stem, "")
 
-                index_output = st.session_state.audio_index_orchestrator.index_audio_video(
-                    file_items=file_items,
-                    reference_map=reference_map,
-                    progress_callback=_index_progress,
-                )
+                if ENABLE_ASYNC_INGESTION_WORKERS:
+                    index_output = st.session_state.task_queue.run(
+                        st.session_state.audio_index_orchestrator.index_audio_video,
+                        file_items=file_items,
+                        reference_map=reference_map,
+                        progress_callback=_index_progress,
+                    )
+                else:
+                    index_output = st.session_state.audio_index_orchestrator.index_audio_video(
+                        file_items=file_items,
+                        reference_map=reference_map,
+                        progress_callback=_index_progress,
+                    )
                 st.session_state.av_debug_records = index_output.get("debug_records", [])
             else:
                 loader = DocumentLoader()
@@ -665,10 +737,17 @@ if uploaded_files:
                     st.session_state.index_orchestrator.hype_generator = hype_generator
                     st.session_state.index_orchestrator.enable_hype = ENABLE_HYPE and hype_generator is not None
 
-                index_output = st.session_state.index_orchestrator.index_documents(
-                    file_items=file_items,
-                    progress_callback=_index_progress,
-                )
+                if ENABLE_ASYNC_INGESTION_WORKERS:
+                    index_output = st.session_state.task_queue.run(
+                        st.session_state.index_orchestrator.index_documents,
+                        file_items=file_items,
+                        progress_callback=_index_progress,
+                    )
+                else:
+                    index_output = st.session_state.index_orchestrator.index_documents(
+                        file_items=file_items,
+                        progress_callback=_index_progress,
+                    )
                 st.session_state.av_debug_records = []
         finally:
             for path in temp_file_paths:
@@ -724,6 +803,11 @@ if uploaded_files:
                                 )
 
             st.session_state.documents_indexed = True
+            if ENABLE_DATA_LIFECYCLE:
+                try:
+                    DataLifecycleManager().register_ingestion(file_items)
+                except Exception as ex:
+                    logger.warning("Data lifecycle registration failed | error=%s", ex)
             st.success(f"{button_label} completed successfully.")
             logger.info("Indexing completed successfully | mode=%s", st.session_state.ingestion_mode)
         else:
@@ -737,6 +821,14 @@ if uploaded_files:
 
 if st.session_state.documents_indexed:
     st.divider()
+
+    if ENABLE_DATA_LIFECYCLE:
+        try:
+            stale = DataLifecycleManager().stale_sources()
+            if stale:
+                st.warning(f"Stale indexed sources detected ({len(stale)}). Consider re-indexing soon.")
+        except Exception as ex:
+            logger.warning("Stale source check failed | error=%s", ex)
     
     tab_query, tab_eval_dashboard = st.tabs(["Query & Retrieval", "Eval Dashboard"])
     
@@ -759,17 +851,33 @@ if st.session_state.documents_indexed:
 
         st.caption("For Matrix/Table mode, output will be enforced as Markdown table and rendered visually.")
 
+    with st.expander("Advanced Retrieval Controls", expanded=False):
+        source_filter = st.text_input("Source name contains (optional)").strip().lower()
+        recency_boost = st.slider("Recency boost", min_value=0.0, max_value=0.5, value=0.1, step=0.05)
+
     query = st.text_input("Enter your question")
 
     if query and st.button("Get Answer"):
-        logger.info("Get Answer clicked | query=%s", query)
+        query_start = time.perf_counter()
+        logger.info("Get Answer clicked | query=%s", _safe_for_logs(query))
 
         prompt_builder = PromptBuilder()
+        provider_key = st.session_state.llm_provider
+        model_key = st.session_state.llm_model_name
+        breaker = CircuitBreaker(f"{provider_key}:{model_key}")
+        llm_allowed = (not ENABLE_CIRCUIT_BREAKER) or breaker.allow_request()
         try:
-            llm_client = _build_active_llm_client()
+            llm_client = _build_active_llm_client() if llm_allowed else None
         except Exception as ex:
-            st.error(f"Unable to initialize selected LLM provider: {ex}")
+            llm_client = None
+            breaker.record_failure()
             logger.exception("LLM client initialization failed | error=%s", ex)
+
+        if not llm_allowed:
+            st.warning("Primary model circuit breaker is open; running in degraded mode.")
+
+        if llm_client is None and st.session_state.query_orchestrator is None:
+            st.error("LLM provider is unavailable and no warm query orchestrator exists yet. Retry after cooldown.")
             st.stop()
 
         if st.session_state.query_orchestrator is None:
@@ -788,6 +896,7 @@ if st.session_state.documents_indexed:
                     max_sub_queries=QUERY_DECOMPOSER_MAX_SUB_QUERIES,
                 )
                 if decomposition_meta.get("is_multi_part") and decomposition_meta.get("sub_queries"):
+                    final_query = " ; ".join(decomposition_meta.get("sub_queries", []))
                     if st.session_state.debug_enabled:
                         st.caption(
                             f"Query decomposed: {decomposition_meta.get('decomposition_notes')}"
@@ -799,7 +908,7 @@ if st.session_state.documents_indexed:
                 logger.warning("Query decomposition failed; using original query | error=%s", ex)
 
         intent_router = QueryIntentRouter()
-        intent_policy = intent_router.route(query)
+        intent_policy = intent_router.route(final_query)
         routed_top_k = int(intent_policy.get("top_k", 5))
         if st.session_state.debug_enabled:
             st.caption(
@@ -821,7 +930,7 @@ if st.session_state.documents_indexed:
                 )
 
             retrieval_output = st.session_state.query_orchestrator.retrieve(
-                query,
+                final_query,
                 top_k=routed_top_k,
                 progress_callback=_query_progress,
                 conversation_history=st.session_state.conversation_memory.get_history(num_turns=3) if ENABLE_CONVERSATION_MEMORY else None,
@@ -834,6 +943,63 @@ if st.session_state.documents_indexed:
             response_language_reason = retrieval_output.get("response_language_reason", "detected")
             response_language_instruction = retrieval_output.get("response_language_instruction", "")
             reranked_results = retrieval_output["results"]
+
+            if ENABLE_HIERARCHICAL_RETRIEVAL:
+                try:
+                    query_embedding = st.session_state.embedder.embed_query(query)
+                    hierarchical = HierarchicalRetriever(st.session_state.vector_store)
+                    if HIERARCHICAL_USE_DIVERSITY:
+                        h_result = hierarchical.retrieve_with_diversity(
+                            query_embedding=query_embedding,
+                            top_documents=HIERARCHICAL_TOP_DOCUMENTS,
+                            top_chunks_per_doc=HIERARCHICAL_TOP_CHUNKS_PER_DOC,
+                            diversity_penalty=HIERARCHICAL_DIVERSITY_PENALTY,
+                        )
+                    else:
+                        h_result = hierarchical.retrieve_hierarchical(
+                            query_embedding=query_embedding,
+                            top_documents=HIERARCHICAL_TOP_DOCUMENTS,
+                            top_chunks_per_doc=HIERARCHICAL_TOP_CHUNKS_PER_DOC,
+                        )
+                    reranked_results = h_result.get("results", reranked_results)
+                    retrieval_output["results"] = reranked_results
+                    if st.session_state.debug_enabled:
+                        st.caption(
+                            f"Hierarchical retrieval active | docs={h_result.get('stage1_doc_count', 0)} | chunks={len(reranked_results)}"
+                        )
+                except Exception as ex:
+                    logger.warning("Hierarchical retrieval failed; using orchestrator results | error=%s", ex)
+
+            if source_filter:
+                reranked_results = [
+                    item for item in reranked_results
+                    if source_filter in str(item.get("metadata", {}).get("source", "")).lower()
+                ]
+
+            if recency_boost > 0 and reranked_results and ENABLE_DATA_LIFECYCLE:
+                try:
+                    ts_map = DataLifecycleManager().get_source_timestamps()
+
+                    def _recency_score(meta):
+                        source = meta.get("source", "")
+                        ts = ts_map.get(source, "")
+                        if not ts:
+                            return 0.0
+                        try:
+                            dt = pd.to_datetime(ts, utc=True)
+                            age_days = max(0.0, (pd.Timestamp.utcnow() - dt).total_seconds() / 86400.0)
+                            return 1.0 / (1.0 + age_days)
+                        except Exception:
+                            return 0.0
+
+                    for item in reranked_results:
+                        base_score = float(item.get("rerank_score", item.get("score", 0.0)))
+                        r_score = _recency_score(item.get("metadata", {}))
+                        item["rerank_score"] = base_score + (float(recency_boost) * r_score)
+
+                    reranked_results.sort(key=lambda x: float(x.get("rerank_score", x.get("score", 0.0))), reverse=True)
+                except Exception as ex:
+                    logger.warning("Recency boost scoring failed | error=%s", ex)
 
             logger.info(
                 "LangGraph retrieval complete | results=%d | query_language=%s",
@@ -879,6 +1045,14 @@ if st.session_state.documents_indexed:
                 response_language_name=response_language_name,
             )
 
+            if CITATION_IN_PROMPT:
+                messages.append(
+                    {
+                        "role": "user",
+                        "content": "Include inline citations in the format [Source N] for factual claims wherever possible.",
+                    }
+                )
+
             if generation_mode == "Matrix":
                 messages.append(
                     {
@@ -922,13 +1096,28 @@ if st.session_state.documents_indexed:
             else:
                 max_tokens = RESPONSE_MAX_TOKENS
 
-            answer = llm_client.generate(
-                messages,
-                max_tokens=max_tokens,
-                temperature=0.2,
-            )
+            generated_in_degraded_mode = False
+            if llm_client is None and ENABLE_DEGRADED_MODE:
+                answer = _build_degraded_answer(query=query, retrieved_docs=reranked_results)
+                generated_in_degraded_mode = True
+            else:
+                try:
+                    answer = llm_client.generate(
+                        messages,
+                        max_tokens=max_tokens,
+                        temperature=0.2,
+                    )
+                    breaker.record_success()
+                except Exception as ex:
+                    breaker.record_failure()
+                    if ENABLE_DEGRADED_MODE:
+                        logger.warning("Generation failed, using degraded mode | error=%s", ex)
+                        answer = _build_degraded_answer(query=query, retrieved_docs=reranked_results)
+                        generated_in_degraded_mode = True
+                    else:
+                        raise
 
-            if requested_mcq_count > 0:
+            if requested_mcq_count > 0 and llm_client is not None and not generated_in_degraded_mode:
                 generated_mcqs = _count_mcqs_in_text(answer)
                 logger.info("MCQ count after first pass | generated=%d | target=%d", generated_mcqs, requested_mcq_count)
 
@@ -974,7 +1163,7 @@ if st.session_state.documents_indexed:
         answer = _strip_question_echo(answer, query)
 
         language_compliance_meta = {"rewritten": False, "detected": "unknown", "target": response_language}
-        if ENABLE_LANGUAGE_COMPLIANCE_REWRITE:
+        if ENABLE_LANGUAGE_COMPLIANCE_REWRITE and llm_client is not None:
             answer, language_compliance_meta = _enforce_answer_language(
                 llm_client=llm_client,
                 query=query,
@@ -994,7 +1183,7 @@ if st.session_state.documents_indexed:
 
         # Tier 3: Agentic answer refinement loop (faithfulness/usefulness guided)
         tier3_meta = {"enabled": False, "refined": False, "rounds_used": 0}
-        if ENABLE_TIER3_AGENTIC_RAG:
+        if ENABLE_TIER3_AGENTIC_RAG and llm_client is not None:
             try:
                 tier3_agent = Tier3AgenticRAG(
                     llm_client=llm_client,
@@ -1042,7 +1231,7 @@ if st.session_state.documents_indexed:
             "retrieval": {"relevance": 0.5, "coverage": 0.5, "noise": 0.5},
             "generation": {"faithfulness": 0.5, "completeness": 0.5, "language_adherence": 0.5},
         }
-        if ENABLE_LLM_JUDGE:
+        if ENABLE_LLM_JUDGE and llm_client is not None:
             try:
                 judge = LLMJudge(llm_client=llm_client)
                 judge_result = judge.evaluate(
@@ -1070,7 +1259,7 @@ if st.session_state.documents_indexed:
         }
         if ENABLE_CITATION_GROUNDING:
             try:
-                citation_verifier = CitationVerifier(llm_client=llm_client if ENABLE_CITATION_AUGMENTATION else None)
+                citation_verifier = CitationVerifier(llm_client=llm_client if ENABLE_CITATION_AUGMENTATION and llm_client is not None else None)
                 citation_result = citation_verifier.verify_citations(
                     answer=answer,
                     retrieved_docs=reranked_results,
@@ -1128,6 +1317,11 @@ if st.session_state.documents_indexed:
             info_parts.append(
                 f"Grounding: {float(grounding_result.get('support_ratio', 0.5)):.0%}"
             )
+
+        if ENABLE_CITATION_GROUNDING:
+            info_parts.append(
+                f"Citation Support: {float(citation_result.get('claim_support_ratio', 0.7)):.0%}"
+            )
         
         # Show if query was contextualized from history
         if retrieval_output.get("query_contextualized"):
@@ -1144,6 +1338,9 @@ if st.session_state.documents_indexed:
         if ENABLE_GROUNDING_VERIFIER and float(grounding_result.get("support_ratio", 0.5)) < float(GROUNDING_MIN_SUPPORT_RATIO):
             should_refuse = True
             refusal_reason = f"grounding_low_support_{float(grounding_result.get('support_ratio', 0.5)):.2f}"
+        if ENABLE_CITATION_GROUNDING and float(citation_result.get("claim_support_ratio", 0.7)) < float(CITATION_MIN_SUPPORT_RATIO):
+            should_refuse = True
+            refusal_reason = f"citation_low_support_{float(citation_result.get('claim_support_ratio', 0.7)):.2f}"
         if should_refuse:
             st.warning(
                 f"⚠️ **Unable to provide a reliable answer** \n\n"
@@ -1165,6 +1362,10 @@ if st.session_state.documents_indexed:
             if st.session_state.debug_enabled and ENABLE_GROUNDING_VERIFIER:
                 with st.expander("Grounding Verifier Details"):
                     st.json(grounding_result)
+
+            if st.session_state.debug_enabled and ENABLE_CITATION_GROUNDING:
+                with st.expander("Citation Verifier Details"):
+                    st.json(citation_result)
             
             # Store in conversation memory
             if ENABLE_CONVERSATION_MEMORY:
@@ -1179,8 +1380,7 @@ if st.session_state.documents_indexed:
                 )
 
         try:
-            EvalLogger().write(
-                {
+            eval_payload = {
                     "query": query,
                     "intent": intent_policy.get("intent", "qa"),
                     "routed_top_k": routed_top_k,
@@ -1198,12 +1398,56 @@ if st.session_state.documents_indexed:
                         "is_multi_part": decomposition_meta.get("is_multi_part", False),
                         "sub_query_count": len(decomposition_meta.get("sub_queries", [])),
                     } if ENABLE_QUERY_DECOMPOSITION else {},
+                    "language_compliance": language_compliance_meta,
+                    "degraded_mode": bool(generated_in_degraded_mode),
                     "refused": bool(should_refuse),
                     "refusal_reason": refusal_reason if should_refuse else "",
                 }
-            )
+            EvalLogger().write(_safe_for_logs(eval_payload))
         except Exception as ex:
             logger.warning("Eval logger write failed | error=%s", ex)
+
+        query_ms = (time.perf_counter() - query_start) * 1000.0
+        prompt_tokens = estimate_tokens("\n".join([m.get("content", "") for m in messages]))
+        completion_tokens = estimate_tokens(answer)
+        est_cost = estimate_cost_usd(
+            provider=provider_key,
+            prompt_tokens=prompt_tokens,
+            completion_tokens=completion_tokens,
+        )
+
+        if ENABLE_PRODUCTION_TELEMETRY:
+            st.session_state.prod_telemetry.write(
+                _safe_for_logs(
+                    {
+                        "provider": provider_key,
+                        "model": model_key,
+                        "latency_ms": query_ms,
+                        "prompt_tokens_est": prompt_tokens,
+                        "completion_tokens_est": completion_tokens,
+                        "cost_est_usd": est_cost,
+                        "confidence": float(confidence),
+                        "judge_score": float(judge_result.get("overall_score", 0.5)),
+                        "refused": bool(should_refuse),
+                    }
+                )
+            )
+
+        slo = st.session_state.slo_monitor.record(
+            latency_ms=query_ms,
+            success=not should_refuse,
+            language_adherence=(language_compliance_meta.get("detected") == response_language) if answer else True,
+        )
+        if slo.get("breached"):
+            st.warning("SLO breach detected. Reliability alert has been recorded.")
+
+        if ENABLE_QUALITY_ROLLBACK_GUARD:
+            rollback_state = st.session_state.rollback_guard.record(
+                confidence=float(confidence),
+                judge_score=float(judge_result.get("overall_score", 0.5)),
+            )
+            if rollback_state.get("triggered"):
+                st.error("Quality rollback guard triggered: recent quality drift detected.")
 
         table_block = _extract_first_markdown_table(answer)
         if table_block and not should_refuse:
@@ -1224,6 +1468,29 @@ if st.session_state.documents_indexed:
             st.write(
                 f"- {meta.get('source')} | Page {meta.get('page')} | Score {item.get('rerank_score', item.get('score')):.4f}"
             )
+
+        if ENABLE_HUMAN_FEEDBACK:
+            st.divider()
+            st.subheader("Feedback")
+            feedback_choice = st.radio("Was this answer helpful?", ["Yes", "No"], horizontal=True, key=f"feedback_choice_{hash(query)}")
+            feedback_note = st.text_input("Optional feedback note", key=f"feedback_note_{hash(query)}")
+            if st.button("Submit Feedback", key=f"submit_feedback_{hash(query)}"):
+                try:
+                    FeedbackStore().write(
+                        _safe_for_logs(
+                            {
+                                "query": query,
+                                "intent": intent_policy.get("intent", "qa"),
+                                "helpful": feedback_choice == "Yes",
+                                "note": feedback_note,
+                                "confidence": float(confidence),
+                                "refused": bool(should_refuse),
+                            }
+                        )
+                    )
+                    st.success("Feedback recorded.")
+                except Exception as ex:
+                    logger.warning("Feedback logging failed | error=%s", ex)
 
     # ========== TAB 2: Eval Dashboard ==========
     with tab_eval_dashboard:

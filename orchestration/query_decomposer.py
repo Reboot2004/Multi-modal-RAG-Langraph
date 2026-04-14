@@ -4,9 +4,8 @@ Query Decomposition Module
 Decomposes multi-part questions into independent sub-queries for targeted retrieval.
 """
 
-from typing import List, Dict, Any, Optional
+from typing import List, Dict, Any
 import re
-from llm.client_factory import LLMClient
 
 
 class QueryDecomposer:
@@ -15,7 +14,7 @@ class QueryDecomposer:
     Uses LLM to identify logical question boundaries and reformulate each part.
     """
 
-    def __init__(self, llm_client: LLMClient):
+    def __init__(self, llm_client):
         """
         Initialize decomposer with an LLM client for query analysis.
         
@@ -154,7 +153,7 @@ class QueryDecomposer:
         original_query: str,
         sub_queries: List[str],
         sub_results: List[List[Dict[str, Any]]],
-        llm_client: LLMClient,
+        llm_client,
     ) -> str:
         """
         Fuse sub-query results into a cohesive final answer.
@@ -177,7 +176,7 @@ class QueryDecomposer:
             if docs:
                 context_parts.append(f"\n### Part {i+1}: {sub_q}")
                 for doc in docs[:3]:  # Top 3 per sub-query
-                    content = doc.get("page_content", "")[:300]
+                    content = (doc.get("text", "") or doc.get("page_content", ""))[:300]
                     source = doc.get("metadata", {}).get("source", "unknown")
                     context_parts.append(f"**Source: {source}**\n{content}\n")
         

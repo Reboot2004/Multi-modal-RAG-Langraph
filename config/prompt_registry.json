@@ -1,0 +1,17 @@
+{
+    "active": {
+        "prompt_id": "indic-rag-default",
+        "version": "1.0.0",
+        "approved": true,
+        "risk_tier": "standard",
+        "system_prompt": "You are a multilingual document assistant.\n\nRules:\n1. Answer ONLY from the provided context.\n2. If answer is not in context, say you do not know.\n3. Respond in exactly one final language (same as user language unless user explicitly requests another language).\n4. Do not translate unless explicitly asked."
+    },
+    "history": [
+        {
+            "prompt_id": "indic-rag-default",
+            "version": "1.0.0",
+            "approved": true,
+            "risk_tier": "standard"
+        }
+    ]
+}

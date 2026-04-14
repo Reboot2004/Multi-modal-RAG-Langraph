@@ -8,6 +8,7 @@ from config.settings import (
     PROMPT_MAX_CONTEXT_CHUNKS,
 )
 from pipeline_logger import get_logger
+from utils.prompt_registry import get_active_system_prompt
 
 
 logger = get_logger("prompt_builder")
@@ -15,7 +16,8 @@ logger = get_logger("prompt_builder")
 
 class PromptBuilder:
     def __init__(self):
-        self.system_prompt = SYSTEM_PROMPT_TEMPLATE
+        registry_entry = get_active_system_prompt()
+        self.system_prompt = registry_entry.get("system_prompt", SYSTEM_PROMPT_TEMPLATE)
         self.max_context_chars = PROMPT_MAX_CONTEXT_CHARS
         self.max_context_chunks = PROMPT_MAX_CONTEXT_CHUNKS
 

@@ -7,7 +7,6 @@ Verifies that cited chunks actually support the claims.
 
 from typing import List, Dict, Any, Tuple, Optional
 import re
-from llm.client_factory import LLMClient
 
 
 class CitationVerifier:
@@ -15,7 +14,7 @@ class CitationVerifier:
     Verifies that answer claims are grounded in retrieved documents with proper citations.
     """
 
-    def __init__(self, llm_client: Optional[LLMClient] = None):
+    def __init__(self, llm_client=None):
         """Initialize verifier with optional LLM client for citation augmentation."""
         self.llm_client = llm_client
 
@@ -107,7 +106,7 @@ class CitationVerifier:
         
         augmentation_prompt = (
             f"Rewrite the following answer to include proper citations. "
-            f"Add [Source {i}] references after claims that are supported by the provided documents.\n\n"
+            "Add [Source N] references after claims that are supported by the provided documents.\n\n"
             f"Available sources:\n{doc_refs}\n\n"
             f"Original answer:\n{answer}\n\n"
             f"Rewrite with citations:"

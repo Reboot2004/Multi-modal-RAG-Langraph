@@ -316,6 +316,77 @@ HIERARCHICAL_DIVERSITY_PENALTY = 0.1  # Penalty for redundant chunks (0-1)
 HIERARCHICAL_USE_DIVERSITY = True  # Apply diversity re-ranking
 
 # ==============================
+# PRODUCTION RELIABILITY
+# ==============================
+
+ENABLE_CIRCUIT_BREAKER = True
+CIRCUIT_BREAKER_FAILURE_THRESHOLD = 3
+CIRCUIT_BREAKER_COOLDOWN_SECONDS = 60
+RELIABILITY_STATE_PATH = os.path.join(PROCESSED_DATA_DIR, "reliability_state.json")
+
+ENABLE_DEGRADED_MODE = True
+
+# Async ingestion worker controls
+ENABLE_ASYNC_INGESTION_WORKERS = True
+INGESTION_WORKER_MAX_THREADS = 2
+
+# SLO thresholds
+SLO_P95_LATENCY_MS = 6500
+SLO_MIN_ANSWER_SUCCESS_RATE = 0.90
+SLO_MIN_LANGUAGE_ADHERENCE = 0.95
+SLO_ALERT_LOG_PATH = os.path.join(PROCESSED_DATA_DIR, "slo_alerts.jsonl")
+
+# Quality rollback trigger
+ENABLE_QUALITY_ROLLBACK_GUARD = True
+ROLLBACK_MIN_AVG_CONFIDENCE = 0.55
+ROLLBACK_MIN_AVG_JUDGE_SCORE = 0.55
+ROLLBACK_WINDOW_SIZE = 30
+ROLLBACK_SIGNAL_PATH = os.path.join(PROCESSED_DATA_DIR, "rollback_signal.json")
+
+# ==============================
+# SECURITY + COMPLIANCE
+# ==============================
+
+ENABLE_PII_REDACTION = True
+PII_REDACTION_LOGS_ONLY = True
+
+# ==============================
+# OBSERVABILITY
+# ==============================
+
+ENABLE_PRODUCTION_TELEMETRY = True
+PRODUCTION_TELEMETRY_LOG_PATH = os.path.join(PROCESSED_DATA_DIR, "prod_telemetry.jsonl")
+
+# Approximate token pricing (USD per 1K tokens)
+GROQ_INPUT_COST_PER_1K = 0.0002
+GROQ_OUTPUT_COST_PER_1K = 0.0005
+OPENROUTER_INPUT_COST_PER_1K = 0.0003
+OPENROUTER_OUTPUT_COST_PER_1K = 0.0006
+
+# ==============================
+# DATA LIFECYCLE MANAGEMENT
+# ==============================
+
+ENABLE_DATA_LIFECYCLE = True
+DATA_MANIFEST_PATH = os.path.join(PROCESSED_DATA_DIR, "data_manifest.json")
+STALE_DATA_MAX_AGE_DAYS = 45
+
+# ==============================
+# HUMAN FEEDBACK LOOP
+# ==============================
+
+ENABLE_HUMAN_FEEDBACK = True
+FEEDBACK_LOG_PATH = os.path.join(PROCESSED_DATA_DIR, "human_feedback.jsonl")
+
+# ==============================
+# GOVERNANCE + PROMPT REGISTRY
+# ==============================
+
+ENABLE_PROMPT_REGISTRY = True
+PROMPT_REGISTRY_PATH = os.path.join(BASE_DIR, "config", "prompt_registry.json")
+PROMPT_REGISTRY_STRICT_APPROVAL = True
+
+# ==============================
 # STREAMLIT SETTINGS
 # ==============================
 

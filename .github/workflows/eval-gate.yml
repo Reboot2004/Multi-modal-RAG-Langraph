@@ -1,0 +1,27 @@
+name: Eval Quality Gate
+
+on:
+  pull_request:
+    branches: [ master ]
+  push:
+    branches: [ master ]
+
+jobs:
+  eval-gate:
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Setup Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: "3.11"
+
+      - name: Install minimal deps
+        run: |
+          python -m pip install --upgrade pip
+
+      - name: Run eval quality gate
+        run: |
+          python scripts/eval_gate.py --allow-empty --min-samples 30 --min-confidence 0.55 --min-judge 0.55 --max-refusal-rate 0.35 --min-language-adherence 0.90

@@ -5,7 +5,7 @@ Implements two-stage retrieval: document-level first, then chunk-level within re
 Reduces noise and improves retrieval coherence.
 """
 
-from typing import List, Dict, Any, Optional, Union
+from typing import List, Dict, Any, Optional
 import numpy as np
 from embeddings.vector_store import VectorStore
 
@@ -50,7 +50,7 @@ class HierarchicalRetriever:
             - total_chunks_returned: int
         """
         if total_chunks is None:
-            total_chunks = top_document * top_chunks_per_doc
+            total_chunks = top_documents * top_chunks_per_doc
 
         # Stage 1: Document-level retrieval (aggregate chunks by document source)
         stage1_results = self._retrieve_documents(query_embedding, top_documents)
@@ -61,7 +61,7 @@ class HierarchicalRetriever:
         # Stage 2: Chunk-level retrieval within top documents
         all_results = self.vector_store.search(
             query_embedding=query_embedding,
-            top_k=top_chunks_per_doc * len(top_doc_sources),
+            top_k=max(total_chunks * 2, top_chunks_per_doc * max(1, len(top_doc_sources))),
         )
         
         filtered_results = [
@@ -185,7 +185,6 @@ class HierarchicalRetriever:
         
         # Try to extract embeddings if available
         selected = []
-        used_embeddings = [query_embedding]
         
         for result in results:
             # If we don't have chunk embeddings, use positional diversity
@@ -193,7 +192,6 @@ class HierarchicalRetriever:
             unique_enough = self._is_diverse_from_selected(result, selected, penalty)
             if unique_enough:
                 selected.append(result)
-                used_embeddings.append(result.get("embedding"))
         
         # Return selected results in original order
         return [r for r in results if r in selected]
