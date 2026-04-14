@@ -277,6 +277,8 @@ INTENT_ROUTER_SUMMARY_TOP_K = 10
 # GraphRAG routing scaffold
 ENABLE_GRAPHRAG_ROUTER = True
 GRAPH_GLOBAL_TOP_K_BOOST = 2
+GRAPH_INDEX_PATH = os.path.join(PROCESSED_DATA_DIR, "graphrag_index.json")
+GRAPH_COMMUNITY_TOP_K = 4
 
 ENABLE_GROUNDING_VERIFIER = True
 GROUNDING_MIN_SUPPORT_RATIO = 0.55
@@ -367,6 +369,9 @@ PRODUCTION_TELEMETRY_LOG_PATH = os.path.join(PROCESSED_DATA_DIR, "prod_telemetry
 
 # Optional OpenTelemetry tracing bridge (GenAI semantics ready)
 ENABLE_OTEL_TRACING = False
+OTEL_SERVICE_NAME = "indic_multimodal_rag"
+OTEL_EXPORTER_OTLP_ENDPOINT = os.getenv("OTEL_EXPORTER_OTLP_ENDPOINT", "")
+OTEL_EXPORTER_OTLP_PROTOCOL = os.getenv("OTEL_EXPORTER_OTLP_PROTOCOL", "http/protobuf")
 
 # Approximate token pricing (USD per 1K tokens)
 GROQ_INPUT_COST_PER_1K = 0.0002
@@ -401,6 +406,10 @@ PROMPT_REGISTRY_STRICT_APPROVAL = True
 ENABLE_JUDGE_CONSENSUS = True
 JUDGE_CONSENSUS_COUNT = 2
 JUDGE_MAX_DISAGREEMENT = 0.35
+JUDGE_CONSENSUS_SPECS = [
+    {"provider": "groq", "model": "llama-3.1-8b-instant"},
+    {"provider": "openrouter", "model": "nvidia/nemotron-nano-9b-v2:free"},
+]
 
 # ==============================
 # STREAMLIT SETTINGS

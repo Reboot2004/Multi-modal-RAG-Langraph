@@ -30,6 +30,8 @@ beautifulsoup4==4.14.0
 chonkie>=0.5.1
 python-dotenv>=1.0.1
 opentelemetry-api>=1.27.0
+opentelemetry-sdk>=1.27.0
+opentelemetry-exporter-otlp-proto-http>=1.27.0
 python-docx==1.2.0
 python-pptx==0.6.23
 xlrd==2.0.1

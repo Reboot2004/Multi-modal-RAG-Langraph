@@ -22,6 +22,7 @@ from orchestration.llm_judge import LLMJudge
 from orchestration.query_intent_router import QueryIntentRouter
 from orchestration.query_decomposer import QueryDecomposer
 from orchestration.graphrag_router import GraphRAGRouter
+from orchestration.graphrag_index import GraphRAGIndex
 from orchestration.citation_verifier import CitationVerifier
 from orchestration.judge_consensus import JudgeConsensus
 from orchestration.hierarchical_retriever import HierarchicalRetriever
@@ -96,12 +97,14 @@ from config.settings import (
     ENABLE_ASYNC_INGESTION_WORKERS,
     ENABLE_GRAPHRAG_ROUTER,
     GRAPH_GLOBAL_TOP_K_BOOST,
+    GRAPH_COMMUNITY_TOP_K,
     ENABLE_LATE_INTERACTION_RERANK,
     LATE_INTERACTION_TOP_K,
     ENABLE_OTEL_TRACING,
     ENABLE_JUDGE_CONSENSUS,
     JUDGE_CONSENSUS_COUNT,
     JUDGE_MAX_DISAGREEMENT,
+    JUDGE_CONSENSUS_SPECS,
 )
 from pipeline_logger import get_logger, set_debug_enabled
 
@@ -823,6 +826,20 @@ if uploaded_files:
                     DataLifecycleManager().register_ingestion(file_items)
                 except Exception as ex:
                     logger.warning("Data lifecycle registration failed | error=%s", ex)
+
+            if ENABLE_GRAPHRAG_ROUTER:
+                try:
+                    graph_chunks = [
+                        {
+                            "text": c.get("text", ""),
+                            "metadata": c.get("metadata", {}),
+                        }
+                        for c in all_chunks
+                        if isinstance(c, dict)
+                    ]
+                    GraphRAGIndex().build(graph_chunks)
+                except Exception as ex:
+                    logger.warning("Graph index build failed | error=%s", ex)
             st.success(f"{button_label} completed successfully.")
             logger.info("Indexing completed successfully | mode=%s", st.session_state.ingestion_mode)
         else:
@@ -976,6 +993,22 @@ if st.session_state.documents_indexed:
             response_language_reason = retrieval_output.get("response_language_reason", "detected")
             response_language_instruction = retrieval_output.get("response_language_instruction", "")
             reranked_results = retrieval_output["results"]
+
+            if graph_route.get("graph_enabled"):
+                try:
+                    with tracer.span(
+                        "rag.retrieve.graph",
+                        {
+                            "gen_ai.operation.name": "retrieve",
+                            "rag.route.mode": "graph_global",
+                        },
+                    ):
+                        graph_results = GraphRAGIndex().query(final_query, top_k=GRAPH_COMMUNITY_TOP_K)
+                    if graph_results:
+                        reranked_results = (graph_results + reranked_results)[: max(len(graph_results), routed_top_k)]
+                        retrieval_output["results"] = reranked_results
+                except Exception as ex:
+                    logger.warning("Graph retrieval enrichment failed | error=%s", ex)
 
             if ENABLE_HIERARCHICAL_RETRIEVAL:
                 try:
@@ -1304,6 +1337,7 @@ if st.session_state.documents_indexed:
                         judge_result = JudgeConsensus(
                             llm_client=llm_client,
                             judges=JUDGE_CONSENSUS_COUNT,
+                            judge_specs=JUDGE_CONSENSUS_SPECS,
                         ).evaluate(
                             query=query,
                             retrieved_docs=reranked_results,
