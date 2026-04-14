@@ -74,6 +74,7 @@ from config.settings import (
     LANGUAGE_COMPLIANCE_MIN_CHARS,
     ENABLE_GROUNDING_VERIFIER,
     GROUNDING_MIN_SUPPORT_RATIO,
+    ENABLE_SHOW_FLAGGED_ANSWERS,
     ENABLE_QUERY_DECOMPOSITION,
     QUERY_DECOMPOSER_MAX_SUB_QUERIES,
     ENABLE_CITATION_GROUNDING,
@@ -137,6 +138,32 @@ def _reset_runtime_for_mode_switch():
     st.session_state.index_orchestrator = None
     st.session_state.audio_index_orchestrator = None
     st.session_state.embedder = None
+    st.session_state.av_debug_records = []
+    gc.collect()
+
+
+def _reset_corpus_state(reason: str = "manual_reset"):
+    """Clear the persisted corpus and reset index/query runtime objects."""
+    try:
+        if "vector_store" not in st.session_state or st.session_state.vector_store is None:
+            st.session_state.vector_store = VectorStore()
+
+        if hasattr(st.session_state.vector_store, "clear"):
+            st.session_state.vector_store.clear()
+        else:
+            st.session_state.vector_store = VectorStore()
+    except Exception as ex:
+        logger.warning("Corpus reset encountered an error; recreating vector store | reason=%s | error=%s", reason, ex)
+        st.session_state.vector_store = VectorStore()
+        try:
+            st.session_state.vector_store.clear()
+        except Exception as inner_ex:
+            logger.warning("Fallback corpus clear failed | reason=%s | error=%s", reason, inner_ex)
+
+    st.session_state.documents_indexed = False
+    st.session_state.query_orchestrator = None
+    st.session_state.index_orchestrator = None
+    st.session_state.audio_index_orchestrator = None
     st.session_state.av_debug_records = []
     gc.collect()
 
@@ -602,12 +629,7 @@ if ENABLE_AUDIO_VIDEO_INGESTION:
 
 if st.button("Reset Corpus"):
     logger.info("Reset Corpus button clicked")
-    if not hasattr(st.session_state.vector_store, "clear"):
-        logger.warning("Session vector_store did not expose clear(); reinitializing instance")
-        st.session_state.vector_store = VectorStore()
-
-    st.session_state.vector_store.clear()
-    st.session_state.documents_indexed = False
+    _reset_corpus_state(reason="manual_reset_button")
     st.success("Corpus reset complete. Upload and index documents again.")
     logger.info("Corpus reset completed")
     st.rerun()
@@ -654,6 +676,9 @@ if uploaded_files:
 
     if st.button(button_label):
         logger.info("%s clicked | mode=%s | files=%d", button_label, st.session_state.ingestion_mode, len(uploaded_files))
+
+        # Replace the corpus on each indexing run so only the current upload is searchable.
+        _reset_corpus_state(reason="reindex_replace_mode")
 
         embedder = st.session_state.embedder
         vector_store = st.session_state.vector_store
@@ -717,11 +742,12 @@ if uploaded_files:
                     reference_map[src] = ref_by_stem.get(stem, "")
 
                 if ENABLE_ASYNC_INGESTION_WORKERS:
+                    # Streamlit UI updates are not thread-safe from worker threads.
                     index_output = st.session_state.task_queue.run(
                         st.session_state.audio_index_orchestrator.index_audio_video,
                         file_items=file_items,
                         reference_map=reference_map,
-                        progress_callback=_index_progress,
+                        progress_callback=None,
                     )
                 else:
                     index_output = st.session_state.audio_index_orchestrator.index_audio_video(
@@ -756,10 +782,11 @@ if uploaded_files:
                     st.session_state.index_orchestrator.enable_hype = ENABLE_HYPE and hype_generator is not None
 
                 if ENABLE_ASYNC_INGESTION_WORKERS:
+                    # Streamlit UI updates are not thread-safe from worker threads.
                     index_output = st.session_state.task_queue.run(
                         st.session_state.index_orchestrator.index_documents,
                         file_items=file_items,
-                        progress_callback=_index_progress,
+                        progress_callback=None,
                     )
                 else:
                     index_output = st.session_state.index_orchestrator.index_documents(
@@ -1470,6 +1497,26 @@ if st.session_state.documents_indexed:
                 f"- Checking if the necessary context is in your indexed documents"
             )
             logger.warning("Hard refusal triggered | confidence=%.2f | reason=%s", confidence, refusal_reason)
+
+            if ENABLE_SHOW_FLAGGED_ANSWERS:
+                st.info(
+                    "Showing flagged answer for debugging only. "
+                    "Treat this as low-trust output."
+                )
+                with st.expander("Flagged Answer (Low Confidence)", expanded=True):
+                    st.write(answer)
+
+                if st.session_state.debug_enabled and ENABLE_LLM_JUDGE:
+                    with st.expander("LLM Judge Details"):
+                        st.json(judge_result)
+
+                if st.session_state.debug_enabled and ENABLE_GROUNDING_VERIFIER:
+                    with st.expander("Grounding Verifier Details"):
+                        st.json(grounding_result)
+
+                if st.session_state.debug_enabled and ENABLE_CITATION_GROUNDING:
+                    with st.expander("Citation Verifier Details"):
+                        st.json(citation_result)
         else:
             st.write(answer)
 
