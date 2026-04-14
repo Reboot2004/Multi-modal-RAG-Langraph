@@ -281,6 +281,41 @@ ENABLE_EVAL_LOGGING = True
 EVAL_LOG_PATH = os.path.join(PROCESSED_DATA_DIR, "rag_eval_log.jsonl")
 
 # ==============================
+# EVAL DASHBOARD
+# ==============================
+
+ENABLE_EVAL_DASHBOARD = True
+EVAL_DASHBOARD_REFRESH_INTERVAL = 5  # Seconds between auto-refresh
+
+# ==============================
+# QUERY DECOMPOSITION (Multi-part Questions)
+# ==============================
+
+ENABLE_QUERY_DECOMPOSITION = True
+QUERY_DECOMPOSER_MAX_SUB_QUERIES = 5
+QUERY_DECOMPOSER_TEMPERATURE = 0.1  # Deterministic decomposition
+QUERY_DECOMPOSER_MAX_TOKENS = 1000
+
+# ==============================
+# CITATION-GROUNDED GENERATION
+# ==============================
+
+ENABLE_CITATION_GROUNDING = True
+ENABLE_CITATION_AUGMENTATION = True  # Add missing citations via LLM
+CITATION_MIN_SUPPORT_RATIO = 0.7  # Acceptable claim support threshold
+CITATION_AUGMENTATION_TEMPERATURE = 0.1
+
+# ==============================
+# HIERARCHICAL RETRIEVAL (Document-level First Pass)
+# ==============================
+
+ENABLE_HIERARCHICAL_RETRIEVAL = False  # Set True to prefer hierarchical over flat
+HIERARCHICAL_TOP_DOCUMENTS = 5  # Stage 1: retrieve N documents
+HIERARCHICAL_TOP_CHUNKS_PER_DOC = 3  # Stage 2: retrieve M chunks per document
+HIERARCHICAL_DIVERSITY_PENALTY = 0.1  # Penalty for redundant chunks (0-1)
+HIERARCHICAL_USE_DIVERSITY = True  # Apply diversity re-ranking
+
+# ==============================
 # STREAMLIT SETTINGS
 # ==============================
 

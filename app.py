@@ -7,6 +7,7 @@ import tempfile
 import re
 import html
 import gc
+import pandas as pd
 
 from ingestion.loader import DocumentLoader
 from embeddings.embedder import MultilingualEmbedder
@@ -18,11 +19,15 @@ from orchestration.langgraph_query import LangGraphQueryOrchestrator
 from orchestration.grounding_verifier import GroundingVerifier
 from orchestration.llm_judge import LLMJudge
 from orchestration.query_intent_router import QueryIntentRouter
+from orchestration.query_decomposer import QueryDecomposer
+from orchestration.citation_verifier import CitationVerifier
+from orchestration.hierarchical_retriever import HierarchicalRetriever
 from orchestration.tier3_agentic_rag import Tier3AgenticRAG
 from orchestration.langgraph_index import LangGraphIndexOrchestrator
 from orchestration.langgraph_audio_index import LangGraphAudioIndexOrchestrator
 from utils.conversation_memory import ConversationMemory
 from utils.eval_logger import EvalLogger
+from utils.eval_dashboard import EvalDashboard
 from config.settings import (
     ENABLE_HYPE,
     ENABLE_AUDIO_VIDEO_INGESTION,
@@ -51,6 +56,17 @@ from config.settings import (
     LANGUAGE_COMPLIANCE_MIN_CHARS,
     ENABLE_GROUNDING_VERIFIER,
     GROUNDING_MIN_SUPPORT_RATIO,
+    ENABLE_QUERY_DECOMPOSITION,
+    QUERY_DECOMPOSER_MAX_SUB_QUERIES,
+    ENABLE_CITATION_GROUNDING,
+    ENABLE_CITATION_AUGMENTATION,
+    CITATION_MIN_SUPPORT_RATIO,
+    ENABLE_HIERARCHICAL_RETRIEVAL,
+    HIERARCHICAL_TOP_DOCUMENTS,
+    HIERARCHICAL_TOP_CHUNKS_PER_DOC,
+    HIERARCHICAL_DIVERSITY_PENALTY,
+    HIERARCHICAL_USE_DIVERSITY,
+    ENABLE_EVAL_DASHBOARD,
 )
 from pipeline_logger import get_logger, set_debug_enabled
 
@@ -716,13 +732,17 @@ if uploaded_files:
 
 
 # -------------------------
-# Question Section
+# Main Tabs: Query, Eval Dashboard
 # -------------------------
 
 if st.session_state.documents_indexed:
-
     st.divider()
-    st.subheader("Ask a Question")
+    
+    tab_query, tab_eval_dashboard = st.tabs(["Query & Retrieval", "Eval Dashboard"])
+    
+    # ========== TAB 1: Query & Retrieval ==========
+    with tab_query:
+        st.subheader("Ask a Question")
 
     with st.expander("Structured Generation (Matrix / Table)", expanded=False):
         generation_mode = st.selectbox(
@@ -756,6 +776,27 @@ if st.session_state.documents_indexed:
             with st.spinner("Initializing LangGraph retrieval orchestrator..."):
                 st.session_state.query_orchestrator = LangGraphQueryOrchestrator(llm_client=llm_client)
             logger.info("LangGraph query orchestrator initialized")
+
+        # Query Decomposition (optional multi-part question handling)
+        final_query = query
+        decomposition_meta = {"is_multi_part": False, "sub_queries": []}
+        if ENABLE_QUERY_DECOMPOSITION:
+            try:
+                decomposer = QueryDecomposer(llm_client=llm_client)
+                decomposition_meta = decomposer.decompose(
+                    query,
+                    max_sub_queries=QUERY_DECOMPOSER_MAX_SUB_QUERIES,
+                )
+                if decomposition_meta.get("is_multi_part") and decomposition_meta.get("sub_queries"):
+                    if st.session_state.debug_enabled:
+                        st.caption(
+                            f"Query decomposed: {decomposition_meta.get('decomposition_notes')}"
+                        )
+                        with st.expander("Sub-queries", expanded=False):
+                            for i, sq in enumerate(decomposition_meta["sub_queries"], 1):
+                                st.write(f"{i}. {sq}")
+            except Exception as ex:
+                logger.warning("Query decomposition failed; using original query | error=%s", ex)
 
         intent_router = QueryIntentRouter()
         intent_policy = intent_router.route(query)
@@ -1019,6 +1060,42 @@ if st.session_state.documents_indexed:
             except Exception as ex:
                 logger.warning("LLM Judge failed; proceeding with Self-RAG only | error=%s", ex)
 
+        # Citation-Grounded Generation verification
+        citation_result = {
+            "citations_found": [],
+            "uncited_claims": [],
+            "claim_support_ratio": 0.7,
+            "issues": [],
+            "is_valid": True,
+        }
+        if ENABLE_CITATION_GROUNDING:
+            try:
+                citation_verifier = CitationVerifier(llm_client=llm_client if ENABLE_CITATION_AUGMENTATION else None)
+                citation_result = citation_verifier.verify_citations(
+                    answer=answer,
+                    retrieved_docs=reranked_results,
+                )
+                logger.info(
+                    "Citation verification | support_ratio=%.2f | citations=%d",
+                    float(citation_result.get("claim_support_ratio", 0.7)),
+                    len(citation_result.get("citations_found", [])),
+                )
+                
+                # Augment answer with missing citations if enabled
+                if ENABLE_CITATION_AUGMENTATION and not citation_result.get("is_valid", True):
+                    try:
+                        augmented_answer, aug_meta = citation_verifier.augment_answer_with_citations(
+                            answer=answer,
+                            retrieved_docs=reranked_results,
+                        )
+                        if aug_meta.get("augmented"):
+                            answer = augmented_answer
+                            logger.info("Citation augmentation applied")
+                    except Exception as ex:
+                        logger.warning("Citation augmentation failed | error=%s", ex)
+            except Exception as ex:
+                logger.warning("Citation verification failed | error=%s", ex)
+
         st.subheader("Answer")
         
         # Display confidence badge and contextual retrieval info
@@ -1116,6 +1193,11 @@ if st.session_state.documents_indexed:
                     },
                     "judge": judge_result,
                     "grounding": grounding_result,
+                    "citations": citation_result if ENABLE_CITATION_GROUNDING else {},
+                    "decomposition": {
+                        "is_multi_part": decomposition_meta.get("is_multi_part", False),
+                        "sub_query_count": len(decomposition_meta.get("sub_queries", [])),
+                    } if ENABLE_QUERY_DECOMPOSITION else {},
                     "refused": bool(should_refuse),
                     "refusal_reason": refusal_reason if should_refuse else "",
                 }
@@ -1142,6 +1224,132 @@ if st.session_state.documents_indexed:
             st.write(
                 f"- {meta.get('source')} | Page {meta.get('page')} | Score {item.get('rerank_score', item.get('score')):.4f}"
             )
+
+    # ========== TAB 2: Eval Dashboard ==========
+    with tab_eval_dashboard:
+        st.subheader("Evaluation Telemetry & Analytics")
+        
+        if not ENABLE_EVAL_DASHBOARD:
+            st.info("Eval dashboard is disabled. Enable ENABLE_EVAL_DASHBOARD in config.")
+        else:
+            try:
+                dashboard = EvalDashboard()
+                records = dashboard.read_logs()
+                
+                if not records:
+                    st.info("No evaluation records yet. Run queries to populate telemetry.")
+                else:
+                    # Summary metrics
+                    summary = dashboard.get_summary_stats(records)
+                    
+                    col1, col2, col3, col4 = st.columns(4)
+                    with col1:
+                        st.metric("Total Queries", summary["total_queries"])
+                    with col2:
+                        st.metric("Avg Confidence", f"{summary['avg_confidence']:.0%}")
+                    with col3:
+                        st.metric("Refusal Rate", f"{summary['refusal_rate']:.0%}")
+                    with col4:
+                        st.metric("Avg Judge Score", f"{summary.get('avg_judge_score', 0.5):.0%}")
+                    
+                    st.divider()
+                    
+                    # Detailed metrics by tabs
+                    metrics_tab1, metrics_tab2, metrics_tab3 = st.tabs(["Overview", "Failed Queries", "Detailed Logs"])
+                    
+                    with metrics_tab1:
+                        col1, col2 = st.columns(2)
+                        
+                        with col1:
+                            st.markdown("### Intent Distribution")
+                            if summary["intents"]:
+                                import pandas as pd
+                                intent_df = pd.DataFrame(
+                                    list(summary["intents"].items()),
+                                    columns=["Intent", "Count"]
+                                )
+                                st.bar_chart(intent_df.set_index("Intent"))
+                            else:
+                                st.info("No intent data available")
+                        
+                        with col2:
+                            st.markdown("### Language Distribution")
+                            if summary["languages"]:
+                                lang_df = pd.DataFrame(
+                                    list(summary["languages"].items()),
+                                    columns=["Language", "Count"]
+                                )
+                                st.bar_chart(lang_df.set_index("Language"))
+                            else:
+                                st.info("No language data available")
+                        
+                        st.markdown("### Confidence by Intent")
+                        if summary["avg_confidence_by_intent"]:
+                            import pandas as pd
+                            conf_df = pd.DataFrame(
+                                list(summary["avg_confidence_by_intent"].items()),
+                                columns=["Intent", "Avg Confidence"]
+                            )
+                            st.bar_chart(conf_df.set_index("Intent"))
+                        
+                        st.markdown("### Judge Verdict Distribution")
+                        if summary["judge_verdict_dist"]:
+                            import pandas as pd
+                            verdict_df = pd.DataFrame(
+                                list(summary["judge_verdict_dist"].items()),
+                                columns=["Verdict", "Count"]
+                            )
+                            st.bar_chart(verdict_df.set_index("Verdict"))
+                        
+                        st.markdown("### Average Quality Scores")
+                        quality_cols = st.columns(3)
+                        with quality_cols[0]:
+                            st.metric("Faithfulness", f"{summary.get('avg_faithfulness', 0.5):.0%}")
+                        with quality_cols[1]:
+                            st.metric("Usefulness", f"{summary.get('avg_usefulness', 0.5):.0%}")
+                        with quality_cols[2]:
+                            st.metric("Grounding", f"{summary.get('avg_grounding_score', 0.5):.0%}")
+                    
+                    with metrics_tab2:
+                        st.markdown("### Failed or Low-Confidence Queries")
+                        failed = dashboard.get_failed_queries(records, limit=10)
+                        
+                        if failed:
+                            for i, record in enumerate(failed, 1):
+                                with st.expander(
+                                    f"[{i}] {record.get('query', 'N/A')[:60]}... "
+                                    f"(conf: {record.get('confidence', 0.5):.0%}, "
+                                    f"refused: {record.get('refused', False)})"
+                                ):
+                                    st.write(f"**Query:** {record.get('query', 'N/A')}")
+                                    st.write(f"**Intent:** {record.get('intent', 'unknown')}")
+                                    st.write(f"**Confidence:** {record.get('confidence', 0.5):.0%}")
+                                    st.write(f"**Refused:** {record.get('refused', False)}")
+                                    st.write(f"**Refusal Reason:** {record.get('refusal_reason', 'N/A')}")
+                                    
+                                    if record.get("judge"):
+                                        st.write("**Judge Verdict:** " + record["judge"].get("verdict", "N/A"))
+                                    if record.get("grounding"):
+                                        st.write(f"**Grounding Support:** {record['grounding'].get('support_ratio', 0.5):.0%}")
+                        else:
+                            st.success("All queries have good confidence!")
+                    
+                    with metrics_tab3:
+                        st.markdown("### All Query Records (Table View)")
+                        df = dashboard.to_dataframe(records)
+                        st.dataframe(df, use_container_width=True)
+                        
+                        # Export option
+                        csv = df.to_csv(index=False)
+                        st.download_button(
+                            label="Download as CSV",
+                            data=csv,
+                            file_name="rag_eval_logs.csv",
+                            mime="text/csv"
+                        )
+            except Exception as ex:
+                st.error(f"Eval dashboard error: {ex}")
+                logger.exception("Eval dashboard exception | error=%s", ex)
 
 else:
     st.info("Upload and index documents to begin.")
