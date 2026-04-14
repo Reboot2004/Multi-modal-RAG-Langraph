@@ -248,9 +248,17 @@ You are a multilingual document assistant.
 Rules:
 1. Answer ONLY from the provided context.
 2. If answer is not in context, say you do not know.
-3. Respond strictly in the same language as the user's question.
+3. Respond in exactly one final language (same as user language unless user explicitly requests another language).
 4. Do not translate unless explicitly asked.
 """
+
+# ==============================
+# LLM JUDGE (Retrieval + Generation Audit)
+# ==============================
+
+ENABLE_LLM_JUDGE = True
+LLM_JUDGE_MIN_OVERALL_SCORE = 0.6
+LLM_JUDGE_TEMPERATURE = 0.0
 
 # ==============================
 # STREAMLIT SETTINGS

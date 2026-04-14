@@ -15,6 +15,7 @@ from llm.prompt_builder import PromptBuilder
 from llm.client_factory import build_llm_client
 from llm.hype_generator import HyPEGenerator
 from orchestration.langgraph_query import LangGraphQueryOrchestrator
+from orchestration.llm_judge import LLMJudge
 from orchestration.tier3_agentic_rag import Tier3AgenticRAG
 from orchestration.langgraph_index import LangGraphIndexOrchestrator
 from orchestration.langgraph_audio_index import LangGraphAudioIndexOrchestrator
@@ -41,6 +42,8 @@ from config.settings import (
     GROQ_MODEL_NAME,
     OPENROUTER_MODEL_NAME,
     ENABLE_TIER3_AGENTIC_RAG,
+    ENABLE_LLM_JUDGE,
+    LLM_JUDGE_MIN_OVERALL_SCORE,
 )
 from pipeline_logger import get_logger, set_debug_enabled
 
@@ -767,6 +770,7 @@ if st.session_state.documents_indexed:
                 query_language=response_language,
                 retrieved_chunks=reranked_results,
                 response_language_instruction=response_language_instruction,
+                response_language_name=response_language_name,
             )
 
             if generation_mode == "Matrix":
@@ -888,18 +892,53 @@ if st.session_state.documents_indexed:
         # Apply final Self-RAG gates to the generated answer
         confidence_scores = _apply_final_self_rag_gates(query, answer, reranked_results, retrieval_output)
 
+        judge_result = {
+            "overall_score": 0.5,
+            "verdict": "caution",
+            "notes": "judge_disabled",
+            "retrieval": {"relevance": 0.5, "coverage": 0.5, "noise": 0.5},
+            "generation": {"faithfulness": 0.5, "completeness": 0.5, "language_adherence": 0.5},
+        }
+        if ENABLE_LLM_JUDGE:
+            try:
+                judge = LLMJudge(llm_client=llm_client)
+                judge_result = judge.evaluate(
+                    query=query,
+                    retrieved_docs=reranked_results,
+                    answer=answer,
+                    expected_language_code=response_language,
+                    expected_language_name=response_language_name,
+                )
+                logger.info(
+                    "LLM Judge | overall=%.2f | verdict=%s",
+                    float(judge_result.get("overall_score", 0.5)),
+                    judge_result.get("verdict", "caution"),
+                )
+            except Exception as ex:
+                logger.warning("LLM Judge failed; proceeding with Self-RAG only | error=%s", ex)
+
         st.subheader("Answer")
         
         # Display confidence badge and contextual retrieval info
         badge = confidence_scores.get("confidence_badge", "🟡")
         level = confidence_scores.get("confidence_level", "MEDIUM")
         confidence = confidence_scores.get("overall_confidence", 0.5)
+        judge_overall = float(judge_result.get("overall_score", 0.5))
+
+        if ENABLE_LLM_JUDGE:
+            confidence = min(confidence, judge_overall)
+            badge, level = st.session_state.query_orchestrator.self_rag_gates.get_confidence_badge(confidence)
         
         info_parts = [
             f"{badge} **Confidence: {level.title()}** ({confidence:.0%}) | "
             f"Faithfulness: {confidence_scores.get('faithfulness_score', 0.5):.0%} | "
             f"Usefulness: {confidence_scores.get('usefulness_score', 0.5):.0%}"
         ]
+
+        if ENABLE_LLM_JUDGE:
+            info_parts.append(
+                f"Judge: {judge_result.get('verdict', 'caution').title()} ({judge_overall:.0%})"
+            )
         
         # Show if query was contextualized from history
         if retrieval_output.get("query_contextualized"):
@@ -910,6 +949,9 @@ if st.session_state.documents_indexed:
         
         # Hard refusal check
         should_refuse, refusal_reason = st.session_state.query_orchestrator.self_rag_gates.should_refuse_answer(confidence)
+        if ENABLE_LLM_JUDGE and judge_overall < float(LLM_JUDGE_MIN_OVERALL_SCORE):
+            should_refuse = True
+            refusal_reason = f"judge_low_score_{judge_overall:.2f}"
         if should_refuse:
             st.warning(
                 f"⚠️ **Unable to provide a reliable answer** \n\n"
@@ -923,6 +965,10 @@ if st.session_state.documents_indexed:
             logger.warning("Hard refusal triggered | confidence=%.2f | reason=%s", confidence, refusal_reason)
         else:
             st.write(answer)
+
+            if st.session_state.debug_enabled and ENABLE_LLM_JUDGE:
+                with st.expander("LLM Judge Details"):
+                    st.json(judge_result)
             
             # Store in conversation memory
             if ENABLE_CONVERSATION_MEMORY:

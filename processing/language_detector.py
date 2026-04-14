@@ -109,6 +109,18 @@ class LanguageDetector:
         if not lowered_text:
             return ""
 
+        # Support explicit ISO language code requests, e.g. "answer in te"
+        for code in self.supported_languages:
+            code_escaped = re.escape(code)
+            code_patterns = [
+                rf"\b(?:answer|respond|reply|write|explain|output|return)\s+(?:in|using)\s+{code_escaped}\b",
+                rf"\bin\s+{code_escaped}\s+(?:language|script)\b",
+                rf"\blanguage\s+code\s*[:=]?\s*{code_escaped}\b",
+            ]
+            for pattern in code_patterns:
+                if re.search(pattern, lowered_text):
+                    return code
+
         for alias, code in self._language_aliases.items():
             escaped = re.escape(alias)
             patterns = [

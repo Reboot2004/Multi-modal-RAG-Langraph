@@ -25,6 +25,7 @@ class PromptBuilder:
         query_language: str,
         retrieved_chunks: List[Dict],
         response_language_instruction: str = "",
+        response_language_name: str = "",
     ) -> List[Dict]:
         """
         Returns messages list formatted for Groq chat completion API.
@@ -72,7 +73,10 @@ Instructions:
 - If the answer is not present, say you do not know.
 - Do not repeat or restate the question.
 - Start directly with the answer.
-- Respond in language code: {query_language}
+- Respond ONLY in one language: {response_language_name or query_language} (code: {query_language}).
+- Do NOT provide bilingual output.
+- Do NOT provide an English version before or after the final answer.
+- Do NOT add translations unless explicitly requested by the user.
 {('- ' + response_language_instruction) if response_language_instruction else ''}
 """
 
