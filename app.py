@@ -44,6 +44,8 @@ from config.settings import (
     ENABLE_TIER3_AGENTIC_RAG,
     ENABLE_LLM_JUDGE,
     LLM_JUDGE_MIN_OVERALL_SCORE,
+    ENABLE_LANGUAGE_COMPLIANCE_REWRITE,
+    LANGUAGE_COMPLIANCE_MIN_CHARS,
 )
 from pipeline_logger import get_logger, set_debug_enabled
 
@@ -127,6 +129,56 @@ def _strip_question_echo(answer: str, query: str) -> str:
             lines = lines[1:]
 
     return "\n".join(lines).strip() if lines else cleaned
+
+
+def _enforce_answer_language(
+    llm_client,
+    query: str,
+    answer: str,
+    expected_language_code: str,
+    expected_language_name: str,
+    response_language_instruction: str,
+    min_chars: int,
+):
+    """Rewrite once if final answer language does not match requested output language."""
+    if not answer or len((answer or "").strip()) < int(min_chars):
+        return answer, {"rewritten": False, "detected": "unknown", "target": expected_language_code}
+
+    detector = LanguageDetector()
+    detected = detector.detect_language(answer)
+    target = (expected_language_code or "en").strip().lower()
+
+    if detected == target:
+        return answer, {"rewritten": False, "detected": detected, "target": target}
+
+    rewrite_prompt = [
+        {
+            "role": "system",
+            "content": (
+                "Rewrite the provided answer into exactly one target language. "
+                "Do not include bilingual output. Keep meaning unchanged."
+            ),
+        },
+        {
+            "role": "user",
+            "content": (
+                f"Question:\n{query}\n\n"
+                f"Current answer:\n{answer}\n\n"
+                f"Target language: {expected_language_name} ({target}).\n"
+                f"{response_language_instruction if response_language_instruction else ''}\n\n"
+                "Return only the rewritten final answer in the target language."
+            ),
+        },
+    ]
+
+    try:
+        rewritten = llm_client.generate(rewrite_prompt, max_tokens=RESPONSE_MAX_TOKENS, temperature=0.0)
+        final_answer = (rewritten or answer).strip()
+        redetected = detector.detect_language(final_answer)
+        return final_answer, {"rewritten": True, "detected": redetected, "target": target}
+    except Exception as ex:
+        logger.warning("Language compliance rewrite failed | error=%s", ex)
+        return answer, {"rewritten": False, "detected": detected, "target": target}
 
 
 def _apply_runtime_profile(loader: DocumentLoader, embedder: MultilingualEmbedder, hype_generator: HyPEGenerator, fast_mode: bool):
@@ -866,6 +918,25 @@ if st.session_state.documents_indexed:
             logger.info("Answer generated | chars=%d", len(answer or ""))
 
         answer = _strip_question_echo(answer, query)
+
+        language_compliance_meta = {"rewritten": False, "detected": "unknown", "target": response_language}
+        if ENABLE_LANGUAGE_COMPLIANCE_REWRITE:
+            answer, language_compliance_meta = _enforce_answer_language(
+                llm_client=llm_client,
+                query=query,
+                answer=answer,
+                expected_language_code=response_language,
+                expected_language_name=response_language_name,
+                response_language_instruction=response_language_instruction,
+                min_chars=LANGUAGE_COMPLIANCE_MIN_CHARS,
+            )
+            if st.session_state.debug_enabled and language_compliance_meta.get("rewritten"):
+                st.caption(
+                    (
+                        "Language compliance rewrite applied | "
+                        f"detected={language_compliance_meta.get('detected')} -> target={language_compliance_meta.get('target')}"
+                    )
+                )
 
         # Tier 3: Agentic answer refinement loop (faithfulness/usefulness guided)
         tier3_meta = {"enabled": False, "refined": False, "rounds_used": 0}

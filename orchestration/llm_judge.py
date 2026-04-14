@@ -2,7 +2,7 @@ import json
 import re
 from typing import Any, Dict, List
 
-from config.settings import LLM_JUDGE_TEMPERATURE
+from config.settings import LLM_JUDGE_MAX_RETRIES, LLM_JUDGE_TEMPERATURE
 from pipeline_logger import get_logger
 
 
@@ -35,7 +35,60 @@ class LLMJudge:
 
         retrieval_block = "\n\n".join(doc_snippets) if doc_snippets else "NO_RETRIEVAL_DOCS"
 
-        prompt = (
+        prompt = self._build_prompt(
+            query=query,
+            retrieval_block=retrieval_block,
+            answer=answer,
+            expected_language_code=expected_language_code,
+            expected_language_name=expected_language_name,
+        )
+
+        try:
+            raw = self.llm_client.generate(
+                [{"role": "user", "content": prompt}],
+                max_tokens=320,
+                temperature=float(LLM_JUDGE_TEMPERATURE),
+            )
+            parsed = self._parse_json(raw)
+            if parsed:
+                return parsed
+
+            # One repair pass for malformed JSON.
+            for retry_idx in range(max(0, int(LLM_JUDGE_MAX_RETRIES))):
+                repair_prompt = (
+                    "Your previous response was not valid JSON. "
+                    "Return only valid JSON matching the exact schema. No markdown, no explanation.\n\n"
+                    f"Original task:\n{prompt}"
+                )
+                raw_retry = self.llm_client.generate(
+                    [{"role": "user", "content": repair_prompt}],
+                    max_tokens=320,
+                    temperature=0.0,
+                )
+                parsed_retry = self._parse_json(raw_retry)
+                if parsed_retry:
+                    logger.info("LLM judge JSON repaired on retry=%d", retry_idx + 1)
+                    return parsed_retry
+        except Exception as ex:
+            logger.warning("LLM judge call failed | error=%s", ex)
+
+        return {
+            "retrieval": {"relevance": 0.5, "coverage": 0.5, "noise": 0.5},
+            "generation": {"faithfulness": 0.5, "completeness": 0.5, "language_adherence": 0.5},
+            "overall_score": 0.5,
+            "verdict": "caution",
+            "notes": "judge_fallback",
+        }
+
+    def _build_prompt(
+        self,
+        query: str,
+        retrieval_block: str,
+        answer: str,
+        expected_language_code: str,
+        expected_language_name: str,
+    ) -> str:
+        return (
             "You are a strict judge for a RAG system. "
             "Evaluate BOTH retrieval quality and answer quality.\n\n"
             "Return ONLY JSON with this schema:\n"
@@ -52,26 +105,6 @@ class LLMJudge:
             f"Retrieved docs:\n{retrieval_block}\n\n"
             f"Answer:\n{answer}\n"
         )
-
-        try:
-            raw = self.llm_client.generate(
-                [{"role": "user", "content": prompt}],
-                max_tokens=320,
-                temperature=float(LLM_JUDGE_TEMPERATURE),
-            )
-            parsed = self._parse_json(raw)
-            if parsed:
-                return parsed
-        except Exception as ex:
-            logger.warning("LLM judge call failed | error=%s", ex)
-
-        return {
-            "retrieval": {"relevance": 0.5, "coverage": 0.5, "noise": 0.5},
-            "generation": {"faithfulness": 0.5, "completeness": 0.5, "language_adherence": 0.5},
-            "overall_score": 0.5,
-            "verdict": "caution",
-            "notes": "judge_fallback",
-        }
 
     def _parse_json(self, raw: str) -> Dict[str, Any]:
         if not raw:
