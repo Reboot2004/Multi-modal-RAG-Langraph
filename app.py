@@ -15,11 +15,14 @@ from llm.prompt_builder import PromptBuilder
 from llm.client_factory import build_llm_client
 from llm.hype_generator import HyPEGenerator
 from orchestration.langgraph_query import LangGraphQueryOrchestrator
+from orchestration.grounding_verifier import GroundingVerifier
 from orchestration.llm_judge import LLMJudge
+from orchestration.query_intent_router import QueryIntentRouter
 from orchestration.tier3_agentic_rag import Tier3AgenticRAG
 from orchestration.langgraph_index import LangGraphIndexOrchestrator
 from orchestration.langgraph_audio_index import LangGraphAudioIndexOrchestrator
 from utils.conversation_memory import ConversationMemory
+from utils.eval_logger import EvalLogger
 from config.settings import (
     ENABLE_HYPE,
     ENABLE_AUDIO_VIDEO_INGESTION,
@@ -46,6 +49,8 @@ from config.settings import (
     LLM_JUDGE_MIN_OVERALL_SCORE,
     ENABLE_LANGUAGE_COMPLIANCE_REWRITE,
     LANGUAGE_COMPLIANCE_MIN_CHARS,
+    ENABLE_GROUNDING_VERIFIER,
+    GROUNDING_MIN_SUPPORT_RATIO,
 )
 from pipeline_logger import get_logger, set_debug_enabled
 
@@ -752,6 +757,14 @@ if st.session_state.documents_indexed:
                 st.session_state.query_orchestrator = LangGraphQueryOrchestrator(llm_client=llm_client)
             logger.info("LangGraph query orchestrator initialized")
 
+        intent_router = QueryIntentRouter()
+        intent_policy = intent_router.route(query)
+        routed_top_k = int(intent_policy.get("top_k", 5))
+        if st.session_state.debug_enabled:
+            st.caption(
+                f"Intent: {intent_policy.get('intent', 'qa')} | Routed top_k={routed_top_k}"
+            )
+
         with st.spinner("Retrieving relevant context..."):
             progress_col_1, progress_col_2 = st.columns([2, 5])
             with progress_col_1:
@@ -768,7 +781,7 @@ if st.session_state.documents_indexed:
 
             retrieval_output = st.session_state.query_orchestrator.retrieve(
                 query,
-                top_k=5,
+                top_k=routed_top_k,
                 progress_callback=_query_progress,
                 conversation_history=st.session_state.conversation_memory.get_history(num_turns=3) if ENABLE_CONVERSATION_MEMORY else None,
             )
@@ -963,6 +976,24 @@ if st.session_state.documents_indexed:
         # Apply final Self-RAG gates to the generated answer
         confidence_scores = _apply_final_self_rag_gates(query, answer, reranked_results, retrieval_output)
 
+        grounding_result = {
+            "support_ratio": 0.5,
+            "supported_sentences": 0,
+            "total_sentences": 0,
+            "unsupported_examples": [],
+        }
+        if ENABLE_GROUNDING_VERIFIER:
+            try:
+                grounding_result = GroundingVerifier().evaluate(answer=answer, retrieved_docs=reranked_results)
+                logger.info(
+                    "Grounding verifier | support_ratio=%.2f | supported=%d/%d",
+                    float(grounding_result.get("support_ratio", 0.5)),
+                    int(grounding_result.get("supported_sentences", 0)),
+                    int(grounding_result.get("total_sentences", 0)),
+                )
+            except Exception as ex:
+                logger.warning("Grounding verifier failed | error=%s", ex)
+
         judge_result = {
             "overall_score": 0.5,
             "verdict": "caution",
@@ -999,6 +1030,11 @@ if st.session_state.documents_indexed:
         if ENABLE_LLM_JUDGE:
             confidence = min(confidence, judge_overall)
             badge, level = st.session_state.query_orchestrator.self_rag_gates.get_confidence_badge(confidence)
+
+        if ENABLE_GROUNDING_VERIFIER:
+            support_ratio = float(grounding_result.get("support_ratio", 0.5))
+            confidence = min(confidence, support_ratio)
+            badge, level = st.session_state.query_orchestrator.self_rag_gates.get_confidence_badge(confidence)
         
         info_parts = [
             f"{badge} **Confidence: {level.title()}** ({confidence:.0%}) | "
@@ -1009,6 +1045,11 @@ if st.session_state.documents_indexed:
         if ENABLE_LLM_JUDGE:
             info_parts.append(
                 f"Judge: {judge_result.get('verdict', 'caution').title()} ({judge_overall:.0%})"
+            )
+
+        if ENABLE_GROUNDING_VERIFIER:
+            info_parts.append(
+                f"Grounding: {float(grounding_result.get('support_ratio', 0.5)):.0%}"
             )
         
         # Show if query was contextualized from history
@@ -1023,6 +1064,9 @@ if st.session_state.documents_indexed:
         if ENABLE_LLM_JUDGE and judge_overall < float(LLM_JUDGE_MIN_OVERALL_SCORE):
             should_refuse = True
             refusal_reason = f"judge_low_score_{judge_overall:.2f}"
+        if ENABLE_GROUNDING_VERIFIER and float(grounding_result.get("support_ratio", 0.5)) < float(GROUNDING_MIN_SUPPORT_RATIO):
+            should_refuse = True
+            refusal_reason = f"grounding_low_support_{float(grounding_result.get('support_ratio', 0.5)):.2f}"
         if should_refuse:
             st.warning(
                 f"⚠️ **Unable to provide a reliable answer** \n\n"
@@ -1040,6 +1084,10 @@ if st.session_state.documents_indexed:
             if st.session_state.debug_enabled and ENABLE_LLM_JUDGE:
                 with st.expander("LLM Judge Details"):
                     st.json(judge_result)
+
+            if st.session_state.debug_enabled and ENABLE_GROUNDING_VERIFIER:
+                with st.expander("Grounding Verifier Details"):
+                    st.json(grounding_result)
             
             # Store in conversation memory
             if ENABLE_CONVERSATION_MEMORY:
@@ -1052,6 +1100,28 @@ if st.session_state.documents_indexed:
                         "contextualized": retrieval_output.get("query_contextualized", False),
                     }
                 )
+
+        try:
+            EvalLogger().write(
+                {
+                    "query": query,
+                    "intent": intent_policy.get("intent", "qa"),
+                    "routed_top_k": routed_top_k,
+                    "retrieved_count": len(reranked_results),
+                    "response_language": response_language,
+                    "confidence": float(confidence),
+                    "self_rag": {
+                        "faithfulness": float(confidence_scores.get("faithfulness_score", 0.5)),
+                        "usefulness": float(confidence_scores.get("usefulness_score", 0.5)),
+                    },
+                    "judge": judge_result,
+                    "grounding": grounding_result,
+                    "refused": bool(should_refuse),
+                    "refusal_reason": refusal_reason if should_refuse else "",
+                }
+            )
+        except Exception as ex:
+            logger.warning("Eval logger write failed | error=%s", ex)
 
         table_block = _extract_first_markdown_table(answer)
         if table_block and not should_refuse:
