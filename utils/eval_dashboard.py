@@ -11,6 +11,8 @@ from datetime import datetime
 import pandas as pd
 from collections import defaultdict, Counter
 
+from config.settings import GRAPH_INDEX_PATH
+
 
 class EvalDashboard:
     """Reader and analyzer for RAG evaluation telemetry logs."""
@@ -18,6 +20,58 @@ class EvalDashboard:
     def __init__(self, log_path: str = "data/processed/rag_eval_log.jsonl"):
         """Initialize dashboard with path to JSONL log file."""
         self.log_path = Path(log_path)
+        self.graph_index_path = Path(GRAPH_INDEX_PATH)
+
+    def read_graph_index(self) -> Dict[str, Any]:
+        """Read persisted GraphRAG index payload if available."""
+        if not self.graph_index_path.exists():
+            return {"entities": [], "relations": [], "communities": []}
+        try:
+            with open(self.graph_index_path, "r", encoding="utf-8") as f:
+                payload = json.load(f)
+            if not isinstance(payload, dict):
+                return {"entities": [], "relations": [], "communities": []}
+            payload.setdefault("entities", [])
+            payload.setdefault("relations", [])
+            payload.setdefault("communities", [])
+            return payload
+        except Exception:
+            return {"entities": [], "relations": [], "communities": []}
+
+    def get_graph_health_stats(self, graph_payload: Dict[str, Any]) -> Dict[str, Any]:
+        """Compute graph quality/coverage statistics for dashboard display."""
+        entities = graph_payload.get("entities", []) or []
+        relations = graph_payload.get("relations", []) or []
+        communities = graph_payload.get("communities", []) or []
+
+        total_entity_mentions = sum(int(item.get("count", 0)) for item in entities if isinstance(item, dict))
+        total_relation_mentions = sum(int(item.get("count", 0)) for item in relations if isinstance(item, dict))
+
+        sizes = [int(c.get("size", 0)) for c in communities if isinstance(c, dict)]
+        avg_community_size = (sum(sizes) / len(sizes)) if sizes else 0.0
+
+        top_entities = [
+            {"entity": item.get("name", "unknown"), "count": int(item.get("count", 0))}
+            for item in entities[:15]
+            if isinstance(item, dict)
+        ]
+        top_sources = [
+            {"source": c.get("source", "unknown"), "size": int(c.get("size", 0))}
+            for c in sorted(communities, key=lambda x: int(x.get("size", 0)), reverse=True)[:15]
+            if isinstance(c, dict)
+        ]
+
+        return {
+            "entity_count": len(entities),
+            "relation_count": len(relations),
+            "community_count": len(communities),
+            "total_entity_mentions": total_entity_mentions,
+            "total_relation_mentions": total_relation_mentions,
+            "avg_community_size": avg_community_size,
+            "top_entities": top_entities,
+            "top_sources": top_sources,
+            "has_graph": len(communities) > 0,
+        }
 
     def read_logs(self) -> List[Dict[str, Any]]:
         """Read all records from JSONL log file."""

@@ -1644,7 +1644,7 @@ if st.session_state.documents_indexed:
                     st.divider()
                     
                     # Detailed metrics by tabs
-                    metrics_tab1, metrics_tab2, metrics_tab3 = st.tabs(["Overview", "Failed Queries", "Detailed Logs"])
+                    metrics_tab1, metrics_tab2, metrics_tab3, metrics_tab4 = st.tabs(["Overview", "Failed Queries", "Detailed Logs", "Graph Health"])
                     
                     with metrics_tab1:
                         col1, col2 = st.columns(2)
@@ -1736,6 +1736,52 @@ if st.session_state.documents_indexed:
                             file_name="rag_eval_logs.csv",
                             mime="text/csv"
                         )
+
+                    with metrics_tab4:
+                        st.markdown("### Graph Index Quality")
+                        graph_payload = dashboard.read_graph_index()
+                        graph_stats = dashboard.get_graph_health_stats(graph_payload)
+
+                        if not graph_stats.get("has_graph"):
+                            st.info("No graph index found yet. Index documents to build GraphRAG communities.")
+                        else:
+                            g1, g2, g3, g4 = st.columns(4)
+                            with g1:
+                                st.metric("Entities", graph_stats.get("entity_count", 0))
+                            with g2:
+                                st.metric("Relations", graph_stats.get("relation_count", 0))
+                            with g3:
+                                st.metric("Communities", graph_stats.get("community_count", 0))
+                            with g4:
+                                st.metric("Avg Community Size", f"{graph_stats.get('avg_community_size', 0.0):.1f}")
+
+                            c1, c2 = st.columns(2)
+                            with c1:
+                                st.markdown("### Top Entities")
+                                top_entities = graph_stats.get("top_entities", [])
+                                if top_entities:
+                                    ent_df = pd.DataFrame(top_entities)
+                                    st.bar_chart(ent_df.set_index("entity"))
+                                else:
+                                    st.caption("No entities extracted yet.")
+
+                            with c2:
+                                st.markdown("### Top Source Communities")
+                                top_sources = graph_stats.get("top_sources", [])
+                                if top_sources:
+                                    src_df = pd.DataFrame(top_sources)
+                                    st.bar_chart(src_df.set_index("source"))
+                                else:
+                                    st.caption("No community/source stats yet.")
+
+                            with st.expander("Graph Index Raw Sample", expanded=False):
+                                st.json(
+                                    {
+                                        "entities": graph_payload.get("entities", [])[:10],
+                                        "relations": graph_payload.get("relations", [])[:10],
+                                        "communities": graph_payload.get("communities", [])[:5],
+                                    }
+                                )
             except Exception as ex:
                 st.error(f"Eval dashboard error: {ex}")
                 logger.exception("Eval dashboard exception | error=%s", ex)
