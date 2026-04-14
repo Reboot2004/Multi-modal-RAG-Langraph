@@ -274,8 +274,16 @@ INTENT_ROUTER_DEFAULT_TOP_K = 5
 INTENT_ROUTER_COMPLEX_TOP_K = 8
 INTENT_ROUTER_SUMMARY_TOP_K = 10
 
+# GraphRAG routing scaffold
+ENABLE_GRAPHRAG_ROUTER = True
+GRAPH_GLOBAL_TOP_K_BOOST = 2
+
 ENABLE_GROUNDING_VERIFIER = True
 GROUNDING_MIN_SUPPORT_RATIO = 0.55
+
+# Late-interaction rerank stage
+ENABLE_LATE_INTERACTION_RERANK = True
+LATE_INTERACTION_TOP_K = 8
 
 ENABLE_EVAL_LOGGING = True
 EVAL_LOG_PATH = os.path.join(PROCESSED_DATA_DIR, "rag_eval_log.jsonl")
@@ -357,6 +365,9 @@ PII_REDACTION_LOGS_ONLY = True
 ENABLE_PRODUCTION_TELEMETRY = True
 PRODUCTION_TELEMETRY_LOG_PATH = os.path.join(PROCESSED_DATA_DIR, "prod_telemetry.jsonl")
 
+# Optional OpenTelemetry tracing bridge (GenAI semantics ready)
+ENABLE_OTEL_TRACING = False
+
 # Approximate token pricing (USD per 1K tokens)
 GROQ_INPUT_COST_PER_1K = 0.0002
 GROQ_OUTPUT_COST_PER_1K = 0.0005
@@ -385,6 +396,11 @@ FEEDBACK_LOG_PATH = os.path.join(PROCESSED_DATA_DIR, "human_feedback.jsonl")
 ENABLE_PROMPT_REGISTRY = True
 PROMPT_REGISTRY_PATH = os.path.join(BASE_DIR, "config", "prompt_registry.json")
 PROMPT_REGISTRY_STRICT_APPROVAL = True
+
+# Judge consensus reliability
+ENABLE_JUDGE_CONSENSUS = True
+JUDGE_CONSENSUS_COUNT = 2
+JUDGE_MAX_DISAGREEMENT = 0.35
 
 # ==============================
 # STREAMLIT SETTINGS

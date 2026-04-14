@@ -21,7 +21,9 @@ from orchestration.grounding_verifier import GroundingVerifier
 from orchestration.llm_judge import LLMJudge
 from orchestration.query_intent_router import QueryIntentRouter
 from orchestration.query_decomposer import QueryDecomposer
+from orchestration.graphrag_router import GraphRAGRouter
 from orchestration.citation_verifier import CitationVerifier
+from orchestration.judge_consensus import JudgeConsensus
 from orchestration.hierarchical_retriever import HierarchicalRetriever
 from orchestration.tier3_agentic_rag import Tier3AgenticRAG
 from orchestration.langgraph_index import LangGraphIndexOrchestrator
@@ -35,12 +37,14 @@ from utils.feedback_store import FeedbackStore
 from utils.data_lifecycle import DataLifecycleManager
 from utils.task_queue import TaskQueue
 from utils.reliability_guard import CircuitBreaker, QualityRollbackGuard
+from utils.otel_tracer import OTelTracer
 from utils.production_observability import (
     ProductionTelemetry,
     SLOMonitor,
     estimate_tokens,
     estimate_cost_usd,
 )
+from retrieval.late_interaction_reranker import LateInteractionReranker
 from config.settings import (
     ENABLE_HYPE,
     ENABLE_AUDIO_VIDEO_INGESTION,
@@ -90,6 +94,14 @@ from config.settings import (
     ENABLE_QUALITY_ROLLBACK_GUARD,
     CITATION_IN_PROMPT,
     ENABLE_ASYNC_INGESTION_WORKERS,
+    ENABLE_GRAPHRAG_ROUTER,
+    GRAPH_GLOBAL_TOP_K_BOOST,
+    ENABLE_LATE_INTERACTION_RERANK,
+    LATE_INTERACTION_TOP_K,
+    ENABLE_OTEL_TRACING,
+    ENABLE_JUDGE_CONSENSUS,
+    JUDGE_CONSENSUS_COUNT,
+    JUDGE_MAX_DISAGREEMENT,
 )
 from pipeline_logger import get_logger, set_debug_enabled
 
@@ -507,6 +519,9 @@ if "rollback_guard" not in st.session_state:
 if "task_queue" not in st.session_state:
     st.session_state.task_queue = TaskQueue()
 
+if "otel_tracer" not in st.session_state:
+    st.session_state.otel_tracer = OTelTracer(enabled=ENABLE_OTEL_TRACING)
+
 with st.sidebar:
     st.markdown("### LLM Runtime")
     selected_provider_label = st.selectbox(
@@ -910,12 +925,20 @@ if st.session_state.documents_indexed:
         intent_router = QueryIntentRouter()
         intent_policy = intent_router.route(final_query)
         routed_top_k = int(intent_policy.get("top_k", 5))
+
+        graph_route = {"mode": "baseline_local", "reason": "disabled", "graph_enabled": False}
+        if ENABLE_GRAPHRAG_ROUTER:
+            graph_route = GraphRAGRouter().route(final_query, intent_policy.get("intent", "qa"))
+            if graph_route.get("graph_enabled"):
+                routed_top_k = routed_top_k + int(GRAPH_GLOBAL_TOP_K_BOOST)
+
         if st.session_state.debug_enabled:
             st.caption(
-                f"Intent: {intent_policy.get('intent', 'qa')} | Routed top_k={routed_top_k}"
+                f"Intent: {intent_policy.get('intent', 'qa')} | Route={graph_route.get('mode')} | Routed top_k={routed_top_k}"
             )
 
         with st.spinner("Retrieving relevant context..."):
+            tracer = st.session_state.otel_tracer
             progress_col_1, progress_col_2 = st.columns([2, 5])
             with progress_col_1:
                 st.markdown("**LangGraph Retrieval**")
@@ -929,12 +952,22 @@ if st.session_state.documents_indexed:
                     f"Step {completed}/{total}: {_humanize_graph_step(step_name)} ({int(ratio * 100)}%)"
                 )
 
-            retrieval_output = st.session_state.query_orchestrator.retrieve(
-                final_query,
-                top_k=routed_top_k,
-                progress_callback=_query_progress,
-                conversation_history=st.session_state.conversation_memory.get_history(num_turns=3) if ENABLE_CONVERSATION_MEMORY else None,
-            )
+            with tracer.span(
+                "rag.retrieve",
+                {
+                    "gen_ai.operation.name": "retrieve",
+                    "gen_ai.provider.name": st.session_state.llm_provider,
+                    "rag.intent": intent_policy.get("intent", "qa"),
+                    "rag.route.mode": graph_route.get("mode", "baseline_local"),
+                    "rag.top_k": routed_top_k,
+                },
+            ):
+                retrieval_output = st.session_state.query_orchestrator.retrieve(
+                    final_query,
+                    top_k=routed_top_k,
+                    progress_callback=_query_progress,
+                    conversation_history=st.session_state.conversation_memory.get_history(num_turns=3) if ENABLE_CONVERSATION_MEMORY else None,
+                )
 
             query_language = retrieval_output["query_language"]
             response_language = retrieval_output.get("response_language", query_language)
@@ -1000,6 +1033,24 @@ if st.session_state.documents_indexed:
                     reranked_results.sort(key=lambda x: float(x.get("rerank_score", x.get("score", 0.0))), reverse=True)
                 except Exception as ex:
                     logger.warning("Recency boost scoring failed | error=%s", ex)
+
+            if ENABLE_LATE_INTERACTION_RERANK and reranked_results:
+                try:
+                    with tracer.span(
+                        "rag.rerank.late_interaction",
+                        {
+                            "gen_ai.operation.name": "rerank",
+                            "rag.stage": "late_interaction",
+                        },
+                    ):
+                        reranked_results = LateInteractionReranker().rerank(
+                            query=final_query,
+                            docs=reranked_results,
+                            top_k=min(max(1, int(LATE_INTERACTION_TOP_K)), len(reranked_results)),
+                        )
+                    retrieval_output["results"] = reranked_results
+                except Exception as ex:
+                    logger.warning("Late-interaction rerank failed; continuing | error=%s", ex)
 
             logger.info(
                 "LangGraph retrieval complete | results=%d | query_language=%s",
@@ -1102,11 +1153,20 @@ if st.session_state.documents_indexed:
                 generated_in_degraded_mode = True
             else:
                 try:
-                    answer = llm_client.generate(
-                        messages,
-                        max_tokens=max_tokens,
-                        temperature=0.2,
-                    )
+                    with st.session_state.otel_tracer.span(
+                        "rag.generate",
+                        {
+                            "gen_ai.operation.name": "chat.completions",
+                            "gen_ai.provider.name": st.session_state.llm_provider,
+                            "gen_ai.request.model": st.session_state.llm_model_name,
+                            "gen_ai.usage.input_tokens": estimate_tokens("\n".join([m.get("content", "") for m in messages])),
+                        },
+                    ):
+                        answer = llm_client.generate(
+                            messages,
+                            max_tokens=max_tokens,
+                            temperature=0.2,
+                        )
                     breaker.record_success()
                 except Exception as ex:
                     breaker.record_failure()
@@ -1233,14 +1293,33 @@ if st.session_state.documents_indexed:
         }
         if ENABLE_LLM_JUDGE and llm_client is not None:
             try:
-                judge = LLMJudge(llm_client=llm_client)
-                judge_result = judge.evaluate(
-                    query=query,
-                    retrieved_docs=reranked_results,
-                    answer=answer,
-                    expected_language_code=response_language,
-                    expected_language_name=response_language_name,
-                )
+                with st.session_state.otel_tracer.span(
+                    "rag.judge",
+                    {
+                        "gen_ai.operation.name": "judge",
+                        "rag.judge.consensus_enabled": bool(ENABLE_JUDGE_CONSENSUS),
+                    },
+                ):
+                    if ENABLE_JUDGE_CONSENSUS:
+                        judge_result = JudgeConsensus(
+                            llm_client=llm_client,
+                            judges=JUDGE_CONSENSUS_COUNT,
+                        ).evaluate(
+                            query=query,
+                            retrieved_docs=reranked_results,
+                            answer=answer,
+                            expected_language_code=response_language,
+                            expected_language_name=response_language_name,
+                        )
+                    else:
+                        judge = LLMJudge(llm_client=llm_client)
+                        judge_result = judge.evaluate(
+                            query=query,
+                            retrieved_docs=reranked_results,
+                            answer=answer,
+                            expected_language_code=response_language,
+                            expected_language_name=response_language_name,
+                        )
                 logger.info(
                     "LLM Judge | overall=%.2f | verdict=%s",
                     float(judge_result.get("overall_score", 0.5)),
@@ -1335,6 +1414,11 @@ if st.session_state.documents_indexed:
         if ENABLE_LLM_JUDGE and judge_overall < float(LLM_JUDGE_MIN_OVERALL_SCORE):
             should_refuse = True
             refusal_reason = f"judge_low_score_{judge_overall:.2f}"
+        if ENABLE_LLM_JUDGE and ENABLE_JUDGE_CONSENSUS:
+            disagreement = float(judge_result.get("consensus_meta", {}).get("disagreement", 0.0))
+            if disagreement > float(JUDGE_MAX_DISAGREEMENT):
+                should_refuse = True
+                refusal_reason = f"judge_high_disagreement_{disagreement:.2f}"
         if ENABLE_GROUNDING_VERIFIER and float(grounding_result.get("support_ratio", 0.5)) < float(GROUNDING_MIN_SUPPORT_RATIO):
             should_refuse = True
             refusal_reason = f"grounding_low_support_{float(grounding_result.get('support_ratio', 0.5)):.2f}"
@@ -1383,6 +1467,7 @@ if st.session_state.documents_indexed:
             eval_payload = {
                     "query": query,
                     "intent": intent_policy.get("intent", "qa"),
+                    "route": graph_route,
                     "routed_top_k": routed_top_k,
                     "retrieved_count": len(reranked_results),
                     "response_language": response_language,
@@ -1392,6 +1477,7 @@ if st.session_state.documents_indexed:
                         "usefulness": float(confidence_scores.get("usefulness_score", 0.5)),
                     },
                     "judge": judge_result,
+                    "judge_consensus": judge_result.get("consensus_meta", {}) if ENABLE_JUDGE_CONSENSUS else {},
                     "grounding": grounding_result,
                     "citations": citation_result if ENABLE_CITATION_GROUNDING else {},
                     "decomposition": {
@@ -1428,6 +1514,8 @@ if st.session_state.documents_indexed:
                         "cost_est_usd": est_cost,
                         "confidence": float(confidence),
                         "judge_score": float(judge_result.get("overall_score", 0.5)),
+                        "judge_disagreement": float(judge_result.get("consensus_meta", {}).get("disagreement", 0.0)),
+                        "route_mode": graph_route.get("mode", "baseline_local"),
                         "refused": bool(should_refuse),
                     }
                 )
