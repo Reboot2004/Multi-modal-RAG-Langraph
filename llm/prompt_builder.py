@@ -21,6 +21,38 @@ class PromptBuilder:
         self.max_context_chars = PROMPT_MAX_CONTEXT_CHARS
         self.max_context_chunks = PROMPT_MAX_CONTEXT_CHUNKS
 
+    def _format_source_label(self, metadata: Dict) -> str:
+        source = str(metadata.get("display_source") or metadata.get("source") or "").strip()
+        if not source or source.lower() in {"unknown", "none", "null"}:
+            if metadata.get("graph_mode"):
+                return "Graph community"
+            return str(metadata.get("section_hint") or metadata.get("chunk_type") or "Retrieved source").strip() or "Retrieved source"
+        return source
+
+    def _extract_key_terms(self, metadata: Dict) -> List[str]:
+        raw_terms = []
+        for key in ("lexicon", "keywords", "entities"):
+            value = metadata.get(key, [])
+            if isinstance(value, list):
+                raw_terms.extend(value)
+            elif isinstance(value, str) and value.strip():
+                raw_terms.append(value.strip())
+
+        filtered = []
+        seen = set()
+        for term in raw_terms:
+            cleaned = str(term).strip()
+            if len(cleaned) <= 2:
+                continue
+            lowered = cleaned.lower()
+            if lowered in {"unknown", "page", "source", "section", "chunk", "chunks", "content"}:
+                continue
+            if lowered in seen:
+                continue
+            seen.add(lowered)
+            filtered.append(cleaned)
+        return filtered[:8]
+
     def build_prompt(
         self,
         query: str,
@@ -38,10 +70,16 @@ class PromptBuilder:
         context_chars = 0
 
         for i, item in enumerate(retrieved_chunks[: self.max_context_chunks]):
-            source = item["metadata"].get("source", "unknown")
+            metadata = item["metadata"]
+            source = self._format_source_label(metadata)
             page = item["metadata"].get("page", "unknown")
+            key_terms = self._extract_key_terms(metadata)
 
-            block = f"[Source: {source}, Page: {page}]\n{item['text']}"
+            block_lines = [f"[Source: {source}, Page: {page}]"]
+            if key_terms:
+                block_lines.append(f"Key terms: {', '.join(key_terms)}")
+            block_lines.append(item["text"])
+            block = "\n".join(block_lines)
             next_chars = len(block) + (2 if context_blocks else 0)
             if context_chars + next_chars > self.max_context_chars:
                 remaining = self.max_context_chars - context_chars
