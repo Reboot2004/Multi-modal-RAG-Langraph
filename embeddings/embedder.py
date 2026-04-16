@@ -69,11 +69,11 @@ class MultilingualEmbedder:
             bool(EMBEDDING_LOCAL_FILES_ONLY),
         )
 
-    def _prepare_text(self, text: str) -> str:
+    def _prepare_text(self, text: str):
         words = (text or "").split()
         if len(words) > self.max_words_per_chunk:
-            return " ".join(words[: self.max_words_per_chunk])
-        return text or ""
+            return " ".join(words[: self.max_words_per_chunk]), True
+        return text or "", False
 
     def embed_texts(self, texts):
         """
@@ -83,10 +83,17 @@ class MultilingualEmbedder:
         if not texts:
             return np.empty((0, 0), dtype=np.float32)
 
-        prepared_texts = [self._prepare_text(text) for text in texts]
+        prepared_pairs = [self._prepare_text(text) for text in texts]
+        prepared_texts = [pair[0] for pair in prepared_pairs]
+        truncated_count = sum(1 for _, is_truncated in prepared_pairs if is_truncated)
         total = len(prepared_texts)
         total_batches = (total + self.batch_size - 1) // self.batch_size
-        logger.info("Embedding START | texts=%d | batches=%d", total, total_batches)
+        logger.info(
+            "Embedding START | texts=%d | batches=%d | truncated=%d",
+            total,
+            total_batches,
+            truncated_count,
+        )
 
         all_embeddings = []
         for batch_idx, start in enumerate(range(0, total, self.batch_size), start=1):
@@ -113,6 +120,13 @@ class MultilingualEmbedder:
 
         embeddings = np.vstack(all_embeddings).astype(np.float32)
         logger.debug("Embedded texts | count=%d | shape=%s", len(texts), getattr(embeddings, "shape", "unknown"))
+        if truncated_count > 0:
+            logger.warning(
+                "Embedding truncation applied | truncated=%d | total=%d | max_words=%d",
+                truncated_count,
+                len(texts),
+                self.max_words_per_chunk,
+            )
         logger.info("Embedding END | total=%d | shape=%s", len(texts), getattr(embeddings, "shape", "unknown"))
         return embeddings
 
@@ -121,7 +135,7 @@ class MultilingualEmbedder:
         Embed a single query string.
         Returns normalized numpy vector of shape (dim,)
         """
-        query_prepared = self._prepare_text(query)
+        query_prepared, query_truncated = self._prepare_text(query)
         embedding = self.model.encode(
             query_prepared,
             convert_to_numpy=True,
@@ -129,5 +143,11 @@ class MultilingualEmbedder:
             show_progress_bar=False,
             batch_size=1,
         )
+        if query_truncated:
+            logger.warning(
+                "Query embedding truncated | original_chars=%d | max_words=%d",
+                len(query or ""),
+                self.max_words_per_chunk,
+            )
         logger.debug("Embedded query | chars=%d | shape=%s", len(query or ""), getattr(embedding, "shape", "unknown"))
         return embedding

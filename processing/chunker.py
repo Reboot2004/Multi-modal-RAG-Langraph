@@ -3,7 +3,13 @@
 
 from typing import List, Dict, Tuple
 import re
-from config.settings import CHUNK_SIZE, CHUNK_OVERLAP, CHUNKER_BACKEND
+from config.settings import (
+    CHUNK_SIZE,
+    CHUNK_OVERLAP,
+    CHUNKER_BACKEND,
+    EMBEDDING_MAX_WORDS_PER_CHUNK,
+    EMBEDDING_MODEL_NAME,
+)
 from pipeline_logger import get_logger
 
 
@@ -12,13 +18,33 @@ logger = get_logger("chunker")
 
 class TextChunker:
     def __init__(self):
-        self.chunk_size = CHUNK_SIZE
+        # Keep chunks within embedding budget to reduce downstream truncation.
+        self.chunk_size = min(int(CHUNK_SIZE), int(EMBEDDING_MAX_WORDS_PER_CHUNK))
         self.chunk_overlap = CHUNK_OVERLAP
         self.chunker_backend = (CHUNKER_BACKEND or "legacy").strip().lower()
         self._chonkie_chunker = self._build_chonkie_chunker() if self.chunker_backend == "chonkie" else None
         self._chonkie_config = (int(self.chunk_size), int(self.chunk_overlap))
+        self._tokenizer = self._build_tokenizer()
         logger.info("TextChunker initialized | chunk_size=%d | overlap=%d", self.chunk_size, self.chunk_overlap)
         logger.info("TextChunker backend=%s", self.chunker_backend)
+        if int(CHUNK_SIZE) > int(self.chunk_size):
+            logger.info(
+                "Chunk size clamped to embedding budget | configured=%d | effective=%d",
+                int(CHUNK_SIZE),
+                int(self.chunk_size),
+            )
+
+    def _build_tokenizer(self):
+        try:
+            from transformers import AutoTokenizer
+
+            # Avoid network dependency at runtime; tokenizer helps estimate true token lengths.
+            tokenizer = AutoTokenizer.from_pretrained(EMBEDDING_MODEL_NAME, local_files_only=True)
+            logger.info("Chunk tokenizer initialized | model=%s", EMBEDDING_MODEL_NAME)
+            return tokenizer
+        except Exception as ex:
+            logger.debug("Chunk tokenizer unavailable; using word-count fallback | error=%s", ex)
+            return None
 
     def _build_chonkie_chunker(self):
         try:
@@ -100,7 +126,7 @@ class TextChunker:
         if stripped.startswith("#"):
             return True
 
-        words = re.findall(r"[A-Za-z0-9][A-Za-z0-9'&/-]*", stripped)
+        words = re.findall(r"[A-Za-z0-9\u0900-\u0D7F][A-Za-z0-9\u0900-\u0D7F'&/\-]*", stripped)
         if not (2 <= len(words) <= 12):
             return False
 
@@ -109,8 +135,9 @@ class TextChunker:
             return False
 
         caps_ratio = sum(1 for word in alpha_words if word[:1].isupper()) / max(1, len(alpha_words))
-        is_title_length = len(stripped) <= 120 and not stripped.endswith((".", "!", "?"))
-        return caps_ratio >= 0.75 and is_title_length
+        has_indic = bool(re.search(r"[\u0900-\u0D7F]", stripped))
+        is_title_length = len(stripped) <= 120 and not stripped.endswith((".", "!", "?", "।", "॥"))
+        return is_title_length and (caps_ratio >= 0.75 or has_indic)
 
     def _is_bullet_line(self, line: str) -> bool:
         return bool(re.match(r"^\s*(?:[-*•]|\d+[.)])\s+\S", line or ""))
@@ -120,12 +147,34 @@ class TextChunker:
         if len(stripped) < 4:
             return False
 
-        return bool(
-            re.match(
-                r"^[A-Z][A-Za-z0-9 .,'\-/&]{1,40}(?:[:\-]\s+|\s*$)",
-                stripped,
-            )
-        )
+        if re.match(r"^[^:]{1,42}:\s+", stripped):
+            prefix = stripped.split(":", 1)[0].strip()
+            if 1 <= len(prefix.split()) <= 7:
+                return True
+
+        return bool(re.match(r"^[^\-]{1,42}\-\s+", stripped))
+
+    def _derive_section_hint(self, text: str, chunk_type: str) -> str:
+        if not text:
+            return ""
+
+        first_line = text.splitlines()[0].strip()
+        if chunk_type in {"heading", "speaker"} and first_line:
+            return first_line[:120]
+        return ""
+
+    def _infer_chunk_type(self, text: str) -> str:
+        lines = [line.strip() for line in (text or "").splitlines() if line.strip()]
+        if not lines:
+            return "paragraph"
+
+        if self._is_heading_line(lines[0]):
+            return "heading"
+        if self._is_speaker_line(lines[0]):
+            return "speaker"
+        if any(self._is_bullet_line(line) for line in lines):
+            return "list"
+        return "paragraph"
 
     def _split_structure_blocks(self, text: str) -> List[Tuple[str, str]]:
         """
@@ -193,16 +242,26 @@ class TextChunker:
             "page": page,
             "language": language,
         }
-        if chunk_type:
-            record["chunk_type"] = chunk_type
+        effective_type = chunk_type or self._infer_chunk_type(text)
+        record["chunk_type"] = effective_type
+
+        section_hint = self._derive_section_hint(text=text, chunk_type=effective_type)
+        if section_hint:
+            record["section_hint"] = section_hint
+
         return record
 
     def _approx_token_length(self, text: str) -> int:
         """
-        Rough token estimation using word count.
-        Works reasonably well for multilingual content.
+        Token-length estimation using embedding tokenizer when available,
+        with word-count fallback.
         """
-        return len(text.split())
+        if self._tokenizer is not None:
+            try:
+                return len(self._tokenizer.encode(text or "", add_special_tokens=False))
+            except Exception:
+                pass
+        return len((text or "").split())
 
     def chunk_text(
         self,
@@ -355,12 +414,13 @@ class TextChunker:
                 continue
 
             normalized.append(
-                {
-                    "text": chunk_text,
-                    "source": source,
-                    "page": page,
-                    "language": language,
-                }
+                self._build_chunk_record(
+                    text=chunk_text,
+                    source=source,
+                    page=page,
+                    language=language,
+                    chunk_type=self._infer_chunk_type(chunk_text),
+                )
             )
 
         return normalized

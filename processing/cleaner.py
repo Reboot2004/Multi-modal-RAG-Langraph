@@ -23,13 +23,20 @@ class TextCleaner:
 
     def fix_line_breaks(self, text: str) -> str:
         """
-        Merge broken lines while preserving paragraph structure.
+        Normalize line breaks while preserving structural boundaries.
         """
         # Replace multiple newlines with double newline (paragraph)
         text = re.sub(r"\n\s*\n+", "\n\n", text)
 
-        # Replace single newlines inside paragraphs with space
-        text = re.sub(r"(?<!\n)\n(?!\n)", " ", text)
+        # Join hyphenated wraps from OCR/PDF extraction.
+        text = re.sub(r"(\w)-\n(\w)", r"\1\2", text)
+
+        # Merge only obvious soft wraps where both sides look like sentence continuation.
+        text = re.sub(
+            r"([\w\)\]\u0900-\u0D7F])\n([\w\(\[\u0900-\u0D7F])",
+            lambda m: f"{m.group(1)} {m.group(2)}",
+            text,
+        )
 
         return text
 
