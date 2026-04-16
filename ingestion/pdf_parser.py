@@ -5,6 +5,7 @@ import fitz  # PyMuPDF
 import os
 from typing import List
 
+from ingestion.element_chunker import ElementChunker
 from ingestion.ocr_engine import OCREngine
 from processing.cleaner import TextCleaner
 from processing.language_detector import LanguageDetector
@@ -22,6 +23,7 @@ class PDFParser:
         self.cleaner = TextCleaner()
         self.lang_detector = LanguageDetector()
         self.chunker = TextChunker()
+        self.element_chunker = ElementChunker()
 
     def parse(self, file_path: str, source_name: str = None) -> List[dict]:
         """
@@ -72,11 +74,13 @@ class PDFParser:
             language = self.lang_detector.detect_language(text)
 
             # Chunk page
-            page_chunks = self.chunker.chunk_text(
+            page_chunks = self.element_chunker.chunk_generic(
                 text=text,
                 source=file_name,
                 page=page_number + 1,
                 language=language,
+                element_type="pdf_page_ocr" if used_ocr else "pdf_page_text",
+                section_hint=f"page_{page_number + 1}",
             )
 
             all_chunks.extend(page_chunks)

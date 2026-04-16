@@ -8,6 +8,7 @@ from bs4 import BeautifulSoup
 from docx import Document as DocxDocument
 from pptx import Presentation
 
+from ingestion.element_chunker import ElementChunker
 from pipeline_logger import get_logger
 from processing.chunker import TextChunker
 from processing.cleaner import TextCleaner
@@ -22,22 +23,35 @@ class StructuredFileParser:
         self.cleaner = TextCleaner()
         self.lang_detector = LanguageDetector()
         self.chunker = TextChunker()
+        self.element_chunker = ElementChunker()
 
     def parse_text_like(self, file_path: str, source_name: str = None) -> List[dict]:
         file_name = source_name or os.path.basename(file_path)
+        extension = os.path.splitext(file_path)[1].lower()
 
         with open(file_path, "r", encoding="utf-8", errors="ignore") as f:
             text = f.read()
 
-        return self._to_chunks(text=text, source=file_name, page=1)
+        return self._to_chunks(text=text, source=file_name, page=1, extension=extension)
 
     def parse_docx(self, file_path: str, source_name: str = None) -> List[dict]:
         file_name = source_name or os.path.basename(file_path)
         document = DocxDocument(file_path)
 
         paragraphs = [p.text.strip() for p in document.paragraphs if (p.text or "").strip()]
-        text = "\n\n".join(paragraphs)
-        return self._to_chunks(text=text, source=file_name, page=1)
+        markdown_like = []
+        for paragraph in document.paragraphs:
+            raw = (paragraph.text or "").strip()
+            if not raw:
+                continue
+            style_name = str(getattr(paragraph.style, "name", "") or "")
+            if style_name.lower().startswith("heading"):
+                markdown_like.append(f"## {raw}")
+            else:
+                markdown_like.append(raw)
+
+        text = "\n\n".join(markdown_like or paragraphs)
+        return self._to_chunks(text=text, source=file_name, page=1, extension=".md")
 
     def parse_html(self, file_path: str, source_name: str = None) -> List[dict]:
         file_name = source_name or os.path.basename(file_path)
@@ -47,7 +61,7 @@ class StructuredFileParser:
 
         soup = BeautifulSoup(raw, "html.parser")
         text = soup.get_text(separator="\n")
-        return self._to_chunks(text=text, source=file_name, page=1)
+        return self._to_chunks(text=text, source=file_name, page=1, extension=".html")
 
     def parse_json(self, file_path: str, source_name: str = None) -> List[dict]:
         file_name = source_name or os.path.basename(file_path)
@@ -71,7 +85,7 @@ class StructuredFileParser:
 
         walk(obj)
         text = "\n".join(lines)
-        return self._to_chunks(text=text, source=file_name, page=1)
+        return self._to_chunks(text=text, source=file_name, page=1, extension=".json")
 
     def parse_csv(self, file_path: str, source_name: str = None) -> List[dict]:
         file_name = source_name or os.path.basename(file_path)
@@ -80,15 +94,18 @@ class StructuredFileParser:
         if df.empty:
             return []
 
-        headers = list(df.columns)
-        row_texts = []
+        sample_text = " ".join(df.astype(str).head(15).to_string(index=False).split())
+        language = self.lang_detector.detect_language(sample_text) if sample_text else "en"
 
-        for _, row in df.iterrows():
-            parts = [f"{col}: {row[col]}" for col in headers]
-            row_texts.append(" | ".join(parts))
-
-        text = f"Columns: {', '.join(headers)}\n\n" + "\n".join(row_texts)
-        return self._to_chunks(text=text, source=file_name, page=1)
+        return self.element_chunker.chunk_table_dataframe(
+            df=df,
+            source=file_name,
+            page=1,
+            language=language,
+            table_id="csv_table_1",
+            section_hint="csv_data",
+            rows_per_chunk=20,
+        )
 
     def parse_excel(self, file_path: str, source_name: str = None) -> List[dict]:
         file_name = source_name or os.path.basename(file_path)
@@ -101,15 +118,17 @@ class StructuredFileParser:
                 continue
 
             df = df.fillna("")
-            headers = list(df.columns)
-            row_texts = []
-
-            for _, row in df.iterrows():
-                parts = [f"{col}: {row[col]}" for col in headers]
-                row_texts.append(" | ".join(parts))
-
-            sheet_text = f"Sheet: {sheet_name}\nColumns: {', '.join(headers)}\n\n" + "\n".join(row_texts)
-            sheet_chunks = self._to_chunks(text=sheet_text, source=file_name, page=sheet_idx)
+            sample_text = " ".join(df.astype(str).head(12).to_string(index=False).split())
+            language = self.lang_detector.detect_language(sample_text) if sample_text else "en"
+            sheet_chunks = self.element_chunker.chunk_table_dataframe(
+                df=df,
+                source=file_name,
+                page=sheet_idx,
+                language=language,
+                table_id=f"excel_{sheet_name}",
+                section_hint=f"sheet:{sheet_name}",
+                rows_per_chunk=20,
+            )
             chunks.extend(sheet_chunks)
 
         return chunks
@@ -127,7 +146,7 @@ class StructuredFileParser:
                     texts.append(shape.text.strip())
 
             slide_text = "\n".join(texts)
-            slide_chunks = self._to_chunks(text=slide_text, source=file_name, page=slide_idx)
+            slide_chunks = self._to_chunks(text=slide_text, source=file_name, page=slide_idx, extension=".md")
             chunks.extend(slide_chunks)
 
         return chunks
@@ -143,18 +162,29 @@ class StructuredFileParser:
         text = "\n".join(text_bits)
 
         logger.warning("Legacy .ppt parsing is best-effort text extraction only | source=%s", file_name)
-        return self._to_chunks(text=text, source=file_name, page=1)
+        return self._to_chunks(text=text, source=file_name, page=1, extension=".txt")
 
-    def _to_chunks(self, text: str, source: str, page: int) -> List[dict]:
+    def _to_chunks(self, text: str, source: str, page: int, extension: str = "") -> List[dict]:
         cleaned = self.cleaner.clean(text or "")
         if not cleaned.strip():
             return []
 
         language = self.lang_detector.detect_language(cleaned)
-        chunks = self.chunker.chunk_text(
+
+        ext = (extension or "").lower()
+        if ext in {".md", ".markdown"}:
+            return self.element_chunker.chunk_markdown(
+                text=cleaned,
+                source=source,
+                page=page,
+                language=language,
+            )
+
+        return self.element_chunker.chunk_generic(
             text=cleaned,
             source=source,
             page=page,
             language=language,
+            element_type="structured_text",
+            section_hint="",
         )
-        return chunks

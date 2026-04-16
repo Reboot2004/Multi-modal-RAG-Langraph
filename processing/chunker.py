@@ -163,6 +163,12 @@ class TextChunker:
             return first_line[:120]
         return ""
 
+    def _compose_parent_id(self, source: str, page: int, chunk_type: str, section_hint: str) -> str:
+        safe_section = re.sub(r"[^A-Za-z0-9_\-]+", "_", (section_hint or "")).strip("_")
+        if safe_section:
+            return f"{source}::p{page}::{chunk_type}::{safe_section}"
+        return f"{source}::p{page}::{chunk_type}"
+
     def _infer_chunk_type(self, text: str) -> str:
         lines = [line.strip() for line in (text or "").splitlines() if line.strip()]
         if not lines:
@@ -248,6 +254,13 @@ class TextChunker:
         section_hint = self._derive_section_hint(text=text, chunk_type=effective_type)
         if section_hint:
             record["section_hint"] = section_hint
+
+        record["parent_id"] = self._compose_parent_id(
+            source=source,
+            page=page,
+            chunk_type=effective_type,
+            section_hint=section_hint,
+        )
 
         return record
 

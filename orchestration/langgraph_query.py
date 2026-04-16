@@ -369,17 +369,18 @@ class LangGraphQueryOrchestrator:
             reverse=True,
         )
 
-        source_counts = {}
+        parent_counts = {}
         diversified_results = []
 
         for item in fused_results:
             metadata = item.get("metadata", {})
             source = metadata.get("source", "unknown")
-            used = source_counts.get(source, 0)
+            parent_id = metadata.get("parent_id") or f"source::{source}"
+            used = parent_counts.get(parent_id, 0)
             if used >= self.max_chunks_per_source:
                 continue
 
-            source_counts[source] = used + 1
+            parent_counts[parent_id] = used + 1
             diversified_results.append(item)
 
             if len(diversified_results) >= max(self.initial_top_k, self.final_top_k * 2):

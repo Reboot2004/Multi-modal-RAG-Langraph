@@ -4,6 +4,7 @@
 import os
 from typing import List
 
+from ingestion.element_chunker import ElementChunker
 from ingestion.ocr_engine import OCREngine
 from processing.cleaner import TextCleaner
 from processing.language_detector import LanguageDetector
@@ -21,6 +22,7 @@ class ImageLoader:
         self.cleaner = TextCleaner()
         self.lang_detector = LanguageDetector()
         self.chunker = TextChunker()
+        self.element_chunker = ElementChunker()
 
     def parse(self, file_path: str, source_name: str = None) -> List[dict]:
         """
@@ -53,11 +55,12 @@ class ImageLoader:
         language = self.lang_detector.detect_language(text)
 
         # Chunk text (treat entire image as page 1)
-        chunks = self.chunker.chunk_text(
+        chunks = self.element_chunker.chunk_image_ocr(
             text=text,
             source=file_name,
             page=1,
             language=language,
+            caption_hint=os.path.splitext(file_name)[0],
         )
 
         logger.info("Image parse completed | source=%s | language=%s | chunks=%d", file_name, language, len(chunks))
