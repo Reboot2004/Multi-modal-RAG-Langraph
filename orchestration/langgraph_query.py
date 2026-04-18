@@ -1,4 +1,5 @@
-from typing import Callable, Dict, List, TypedDict
+import re
+from typing import Callable, Dict, List, Set, TypedDict
 
 from langgraph.graph import END, StateGraph
 
@@ -11,6 +12,8 @@ from config.settings import (
     LANGGRAPH_MAX_CHUNKS_PER_SOURCE,
 )
 from llm.groq_client import GroqClient
+from orchestration.adaptive_retrieval import AdaptiveRetrievalStrategy
+from orchestration.query_decomposer import QueryDecomposer
 from orchestration.query_contextualizer import QueryContextualizer
 from orchestration.self_rag_gates import SelfRAGGates
 from pipeline_logger import get_logger
@@ -44,9 +47,18 @@ class QueryGraphState(TypedDict, total=False):
     usefulness_score: float
     overall_confidence: float
     confidence_badge: str
+    retrieval_top_k: int
+    retrieval_mode: str
 
 
 class LangGraphQueryOrchestrator:
+    STOP_TERMS = {
+        "a", "an", "the", "and", "or", "of", "in", "on", "to", "for", "with", "is", "are",
+        "was", "were", "be", "by", "from", "as", "what", "which", "who", "when", "where",
+        "why", "how", "can", "could", "should", "would", "do", "does", "did", "it", "this",
+        "that", "these", "those", "about", "into", "over", "under", "than", "then", "also",
+    }
+
     STEP_ORDER = [
         "detect_language",
         "expand_query",
@@ -62,6 +74,8 @@ class LangGraphQueryOrchestrator:
         self.llm_client = llm_client or GroqClient()
         self.self_rag_gates = SelfRAGGates(llm_client=self.llm_client)
         self.query_contextualizer = QueryContextualizer(llm_client=self.llm_client)
+        self.query_decomposer = QueryDecomposer(llm_client=self.llm_client)
+        self.adaptive_retrieval = AdaptiveRetrievalStrategy()
 
         self.enable_query_expansion = LANGGRAPH_ENABLE_QUERY_EXPANSION
         self.expansion_variants = max(1, int(LANGGRAPH_EXPANSION_VARIANTS))
@@ -247,22 +261,38 @@ class LangGraphQueryOrchestrator:
 
         variants = [query] if query else []
 
+        if query:
+            decomposition = self.query_decomposer.decompose(query, max_sub_queries=4)
+            sub_queries = decomposition.get("sub_queries", []) if decomposition.get("is_multi_part") else []
+            if sub_queries:
+                variants.extend(sub_queries)
+                logger.info(
+                    "LangGraph node expand_query | decomposition_applied=true | sub_queries=%d",
+                    len(sub_queries),
+                )
+
         corpus_size = int(getattr(self.retriever.vector_store.index, "ntotal", 0))
         query_word_count = len(query.split())
 
-        if (
-            not query
-            or not self.enable_query_expansion
-            or self.expansion_variants <= 1
-            or corpus_size <= 3
-            or query_word_count <= 8
-        ):
+        if not query or corpus_size <= 3:
             logger.info(
                 "LangGraph node expand_query | skipped=true | corpus_size=%d | words=%d",
                 corpus_size,
                 query_word_count,
             )
-            return {"query_variants": variants}
+            return {"query_variants": self._dedupe_variants(variants)}
+
+        should_generate_rewrites = (
+            self.enable_query_expansion
+            and self.expansion_variants > 1
+            and query_word_count > 8
+        )
+
+        if not should_generate_rewrites:
+            deduped = self._dedupe_variants(variants)
+            logger.info("LangGraph node expand_query | variants=%d", len(deduped))
+            logger.debug("Query variants: %s", deduped)
+            return {"query_variants": deduped}
 
         additional_needed = max(0, self.expansion_variants - 1)
         messages = [
@@ -292,13 +322,7 @@ class LangGraphQueryOrchestrator:
         except Exception as ex:
             logger.warning("Query expansion failed; using original query only | error=%s", ex)
 
-        deduped = []
-        seen = set()
-        for item in variants:
-            key = item.lower().strip()
-            if key and key not in seen:
-                seen.add(key)
-                deduped.append(item)
+        deduped = self._dedupe_variants(variants)
 
         if not deduped:
             deduped = [query]
@@ -310,23 +334,51 @@ class LangGraphQueryOrchestrator:
 
     def _retrieve_candidates(self, state: QueryGraphState) -> QueryGraphState:
         self._emit_progress("retrieve_candidates")
+        query = state.get("query", "")
         query_variants = state.get("query_variants", [])
+        adaptive_top_k, adaptive_reason = self.adaptive_retrieval.adaptive_top_k(
+            query,
+            base_k=self.initial_top_k,
+        )
+        adaptive_top_k = max(self.final_top_k * 2, adaptive_top_k)
+
         per_query_results = {}
 
         for variant in query_variants:
-            retrieval = self.retriever.retrieve(variant, top_k=self.initial_top_k)
+            retrieval = self.retriever.retrieve(variant, top_k=adaptive_top_k)
             per_query_results[variant] = retrieval.get("results", [])
+
+        should_expand_depth = self._needs_deeper_retrieval(query_variants, per_query_results)
+        retrieval_mode = adaptive_reason
+
+        if should_expand_depth:
+            expanded_top_k = min(max(adaptive_top_k + 10, self.initial_top_k + 8), max(40, self.initial_top_k * 2))
+            retrieval_mode = f"{adaptive_reason}_evidence_expanded"
+            for variant in query_variants:
+                expanded = self.retriever.retrieve(variant, top_k=expanded_top_k).get("results", [])
+                per_query_results[variant] = self._merge_by_chunk_id(
+                    per_query_results.get(variant, []),
+                    expanded,
+                )
+            adaptive_top_k = expanded_top_k
 
         total_candidates = sum(len(v) for v in per_query_results.values())
         logger.info(
-            "LangGraph node retrieve_candidates | variants=%d | total_candidates=%d",
+            "LangGraph node retrieve_candidates | variants=%d | total_candidates=%d | top_k=%d | mode=%s",
             len(query_variants),
             total_candidates,
+            adaptive_top_k,
+            retrieval_mode,
         )
-        return {"per_query_results": per_query_results}
+        return {
+            "per_query_results": per_query_results,
+            "retrieval_top_k": adaptive_top_k,
+            "retrieval_mode": retrieval_mode,
+        }
 
     def _fuse_and_diversify(self, state: QueryGraphState) -> QueryGraphState:
         self._emit_progress("fuse_and_diversify")
+        query = state.get("query", "")
         per_query_results = state.get("per_query_results", {})
 
         fused_by_chunk = {}
@@ -370,7 +422,10 @@ class LangGraphQueryOrchestrator:
         )
 
         parent_counts = {}
+        source_counts = {}
         diversified_results = []
+        max_per_source = max(1, self.max_chunks_per_source - 1)
+        target_pool = max(self.initial_top_k, self.final_top_k * 4)
 
         for item in fused_results:
             metadata = item.get("metadata", {})
@@ -379,12 +434,22 @@ class LangGraphQueryOrchestrator:
             used = parent_counts.get(parent_id, 0)
             if used >= self.max_chunks_per_source:
                 continue
+            if source_counts.get(source, 0) >= max_per_source:
+                continue
 
             parent_counts[parent_id] = used + 1
+            source_counts[source] = source_counts.get(source, 0) + 1
             diversified_results.append(item)
 
-            if len(diversified_results) >= max(self.initial_top_k, self.final_top_k * 2):
+            if len(diversified_results) >= target_pool:
                 break
+
+        diversified_results = self._expand_parent_and_sibling_context(
+            query,
+            diversified_results,
+            fused_results,
+            target_pool=target_pool,
+        )
 
         logger.info(
             "LangGraph node fuse_and_diversify | fused=%d | diversified=%d",
@@ -402,7 +467,12 @@ class LangGraphQueryOrchestrator:
         query = state.get("query", "")
         diversified = state.get("diversified_results", [])
 
-        reranked = self.reranker.rerank(query, diversified, top_k=self.final_top_k)
+        reranked = self.reranker.rerank(
+            query,
+            diversified,
+            top_k=max(self.final_top_k * 4, self.final_top_k),
+        )
+        reranked = self._select_coverage_balanced_results(query, reranked, self.final_top_k)
         logger.info(
             "LangGraph node rerank_final | input=%d | output=%d",
             len(diversified),
@@ -430,7 +500,20 @@ class LangGraphQueryOrchestrator:
             is_relevant, relevance_conf, reason = self.self_rag_gates.gate_doc_relevance(
                 query, final_results
             )
-            scores["doc_relevance_score"] = relevance_conf
+            evidence_conf = self._estimate_evidence_completeness(query, final_results)
+            scores["doc_relevance_score"] = max(0.0, min(1.0, (relevance_conf + evidence_conf) / 2.0))
+            retrieval_conf = max(0.0, min(1.0, len(final_results) / max(1, self.final_top_k)))
+            scores["faithfulness_score"] = max(0.45, evidence_conf * 0.9)
+            scores["usefulness_score"] = max(0.45, evidence_conf)
+            scores["overall_confidence"] = self.self_rag_gates.compute_overall_confidence(
+                retrieval_confidence=retrieval_conf,
+                doc_relevance_confidence=scores["doc_relevance_score"],
+                faithfulness_confidence=scores["faithfulness_score"],
+                usefulness_confidence=scores["usefulness_score"],
+            )
+            scores["confidence_badge"] = self.self_rag_gates.get_confidence_badge(
+                scores["overall_confidence"]
+            )[0]
             if not is_relevant:
                 logger.warning(
                     "Self-RAG Gate 2 triggered low relevance | confidence=%.2f | reason=%s",
@@ -443,9 +526,184 @@ class LangGraphQueryOrchestrator:
         # For now, we'll apply faithfulness and usefulness gates after LLM generation
         # This method just computes doc relevance and sets defaults
         logger.info(
-            "Self-RAG Gates applied | doc_relevance=%.2f | final_results=%d",
+            "Self-RAG Gates applied | doc_relevance=%.2f | overall=%.2f | final_results=%d",
             scores["doc_relevance_score"],
+            scores["overall_confidence"],
             len(final_results),
         )
 
         return scores
+
+    def _dedupe_variants(self, variants: List[str]) -> List[str]:
+        deduped = []
+        seen = set()
+        for item in variants:
+            key = (item or "").lower().strip()
+            if key and key not in seen:
+                seen.add(key)
+                deduped.append((item or "").strip())
+        return deduped
+
+    def _needs_deeper_retrieval(self, query_variants: List[str], per_query_results: Dict[str, List[Dict]]) -> bool:
+        all_results = []
+        for items in per_query_results.values():
+            all_results.extend(items)
+
+        if not all_results:
+            return True
+
+        top_score = max(float(item.get("score", 0.0)) for item in all_results)
+        unique_sources = {
+            str(item.get("metadata", {}).get("source", "unknown"))
+            for item in all_results[: max(8, self.final_top_k * 2)]
+        }
+        multi_hop_query = len(query_variants) > 1
+        weak_signal = top_score < 0.28 or len(unique_sources) < min(2, len(all_results))
+        return multi_hop_query or weak_signal
+
+    def _merge_by_chunk_id(self, base_results: List[Dict], extra_results: List[Dict]) -> List[Dict]:
+        merged = {}
+        for item in base_results + extra_results:
+            metadata = item.get("metadata", {})
+            chunk_id = metadata.get("chunk_id")
+            if chunk_id is None:
+                source = metadata.get("source", "unknown")
+                page = metadata.get("page", "unknown")
+                chunk_id = f"{source}:{page}:{(item.get('text', '') or '')[:80]}"
+
+            existing = merged.get(chunk_id)
+            if existing is None or float(item.get("score", 0.0)) > float(existing.get("score", 0.0)):
+                merged[chunk_id] = item
+
+        return sorted(merged.values(), key=lambda x: float(x.get("score", 0.0)), reverse=True)
+
+    def _expand_parent_and_sibling_context(
+        self,
+        query: str,
+        diversified_results: List[Dict],
+        fused_results: List[Dict],
+        target_pool: int,
+    ) -> List[Dict]:
+        if len(diversified_results) >= target_pool:
+            return diversified_results
+
+        fused_by_chunk_id = {}
+        for item in fused_results:
+            chunk_id = item.get("metadata", {}).get("chunk_id")
+            if chunk_id is not None and chunk_id not in fused_by_chunk_id:
+                fused_by_chunk_id[chunk_id] = item
+
+        selected_chunk_ids = {
+            item.get("metadata", {}).get("chunk_id")
+            for item in diversified_results
+            if item.get("metadata", {}).get("chunk_id") is not None
+        }
+        selected_parent_ids = {
+            item.get("metadata", {}).get("parent_id")
+            for item in diversified_results
+            if item.get("metadata", {}).get("parent_id")
+        }
+
+        query_terms = self._extract_query_terms(query)
+        parent_candidates = []
+        for meta in self.retriever.vector_store.metadata:
+            parent_id = meta.get("parent_id")
+            chunk_id = meta.get("chunk_id")
+            if not parent_id or parent_id not in selected_parent_ids or chunk_id in selected_chunk_ids:
+                continue
+            parent_candidates.append(meta)
+
+        scored_candidates = []
+        for meta in parent_candidates:
+            text = str(meta.get("text", ""))
+            text_terms = self._extract_query_terms(text)
+            overlap = len(query_terms.intersection(text_terms))
+            overlap_bonus = min(0.25, overlap * 0.05)
+            chunk_type = str(meta.get("chunk_type", "")).lower()
+            summary_bonus = 0.08 if "summary" in chunk_type or "heading" in chunk_type else 0.0
+            base_item = fused_by_chunk_id.get(meta.get("chunk_id"))
+            base_score = float(base_item.get("score", 0.0)) if base_item else 0.0
+
+            scored_candidates.append(
+                (
+                    base_score + overlap_bonus + summary_bonus,
+                    {
+                        "score": base_score + overlap_bonus + summary_bonus,
+                        "semantic_score": float(base_item.get("semantic_score", 0.0)) if base_item else 0.0,
+                        "hype_score": float(base_item.get("hype_score", 0.0)) if base_item else 0.0,
+                        "lexical_score": float(base_item.get("lexical_score", 0.0)) if base_item else 0.0,
+                        "text": text,
+                        "metadata": meta,
+                    },
+                )
+            )
+
+        scored_candidates.sort(key=lambda x: x[0], reverse=True)
+        for _, item in scored_candidates:
+            chunk_id = item.get("metadata", {}).get("chunk_id")
+            if chunk_id in selected_chunk_ids:
+                continue
+            diversified_results.append(item)
+            selected_chunk_ids.add(chunk_id)
+            if len(diversified_results) >= target_pool:
+                break
+
+        return diversified_results
+
+    def _extract_query_terms(self, text: str) -> Set[str]:
+        tokens = set(re.findall(r"[A-Za-z0-9]{3,}", (text or "").lower()))
+        return {t for t in tokens if t not in self.STOP_TERMS}
+
+    def _select_coverage_balanced_results(self, query: str, reranked: List[Dict], top_k: int) -> List[Dict]:
+        if len(reranked) <= top_k:
+            return reranked[:top_k]
+
+        query_terms = self._extract_query_terms(query)
+        if not query_terms:
+            return reranked[:top_k]
+
+        remaining = list(reranked)
+        selected = []
+        covered_terms = set()
+        selected_sources = set()
+
+        while remaining and len(selected) < top_k:
+            best_idx = 0
+            best_score = float("-inf")
+
+            for idx, item in enumerate(remaining):
+                item_terms = self._extract_query_terms(item.get("text", ""))
+                new_terms = len((item_terms & query_terms) - covered_terms)
+                source = str(item.get("metadata", {}).get("source", "unknown"))
+                source_bonus = 0.05 if source not in selected_sources else 0.0
+                rerank_score = float(item.get("rerank_score", item.get("score", 0.0)))
+                composite = rerank_score + (new_terms * 0.04) + source_bonus
+
+                if composite > best_score:
+                    best_score = composite
+                    best_idx = idx
+
+            chosen = remaining.pop(best_idx)
+            selected.append(chosen)
+            selected_sources.add(str(chosen.get("metadata", {}).get("source", "unknown")))
+            covered_terms.update(self._extract_query_terms(chosen.get("text", "")) & query_terms)
+
+        return selected
+
+    def _estimate_evidence_completeness(self, query: str, final_results: List[Dict]) -> float:
+        if not final_results:
+            return 0.0
+
+        query_terms = self._extract_query_terms(query)
+        if not query_terms:
+            return min(1.0, len(final_results) / max(1, self.final_top_k))
+
+        covered = set()
+        unique_sources = set()
+        for item in final_results:
+            covered.update(self._extract_query_terms(item.get("text", "")) & query_terms)
+            unique_sources.add(str(item.get("metadata", {}).get("source", "unknown")))
+
+        term_ratio = len(covered) / max(1, len(query_terms))
+        source_ratio = min(1.0, len(unique_sources) / 2.0)
+        return max(0.0, min(1.0, (term_ratio * 0.7) + (source_ratio * 0.3)))
