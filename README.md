@@ -138,3 +138,51 @@ Then open the local URL shown by Streamlit (usually `http://localhost:8501`).
 
 - `.env`, `venv/`, `data/`, caches, and local artifacts are excluded from git via `.gitignore`.
 - Keep secrets only in environment files/variables, never in source code.
+
+## Open-Source RAG Benchmarks
+
+Two benchmark runners are included for retrieval-focused RAG evaluation against open datasets.
+
+### 1) Quick Benchmark
+
+Uses `squad_v2` (answerable subset) for a fast smoke test.
+
+Command:
+
+```bash
+python scripts/benchmark_quick.py --samples 120 --top-k 10
+```
+
+Default output:
+
+`data/processed/benchmarks/quick_benchmark.json`
+
+Metrics:
+
+- `recall@5`, `recall@10`
+- `hit@5`, `hit@10`
+- `mrr`, `ndcg@10`
+- `answer_coverage@5`, `answer_coverage@10`
+
+### 2) Comprehensive Benchmark
+
+Runs a broader suite over:
+
+- `squad_v2`
+- `hotpot_qa` (distractor split)
+
+Command:
+
+```bash
+python scripts/benchmark_comprehensive.py --squad-samples 300 --hotpot-samples 250 --top-k 10
+```
+
+Default output:
+
+`data/processed/benchmarks/comprehensive_benchmark.json`
+
+### Benchmark Notes
+
+- These scripts evaluate retrieval quality with open-source benchmarks.
+- They build an in-memory semantic index and do not mutate your existing FAISS/lexical corpus.
+- First run downloads datasets from Hugging Face, so internet access is required.
